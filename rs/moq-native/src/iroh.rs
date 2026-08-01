@@ -1,8 +1,11 @@
 //! Iroh P2P transport, dialed by endpoint id instead of a hostname.
 //!
-//! A single [`Endpoint`] serves both roles, hole-punching directly to peers and
-//! falling back to an iroh relay. Both WebTransport-over-H3 and raw QUIC are
-//! negotiated via ALPN.
+//! A single [`Endpoint`] serves both roles, connecting directly to peers
+//! (optionally falling back to an iroh relay with `--iroh-relay`). Both
+//! WebTransport-over-H3 and raw QUIC are negotiated via ALPN. The [`local`]
+//! module discovers other MoQ endpoints on the local network via mDNS.
+
+pub mod local;
 
 use std::{net, path::PathBuf, str::FromStr, sync::Arc};
 
@@ -111,6 +114,18 @@ pub enum Error {
 	/// GSO is always on for iroh, so `--quic-gso=false` cannot be honored.
 	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the quinn backend")]
 	GsoUnsupported,
+
+	/// The mDNS discovery service could not start (e.g. no usable network interface).
+	#[error("failed to start local discovery")]
+	Discovery(#[source] iroh::address_lookup::AddressLookupBuilderError),
+
+	/// The endpoint was closed while configuring it.
+	#[error(transparent)]
+	Endpoint(#[from] iroh::endpoint::EndpointError),
+
+	/// The MoQ handshake or an established MoQ session failed.
+	#[error(transparent)]
+	Moq(#[from] moq_net::Error),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -147,20 +162,65 @@ pub struct EndpointConfig {
 	#[arg(id = "iroh-bind-v6", long = "iroh-bind-v6", env = "MOQ_IROH_BIND_V6")]
 	pub bind_v6: Option<net::SocketAddrV6>,
 
-	/// Disable the iroh relay, using only direct P2P connections.
+	/// Fall back to iroh's public relay servers when no direct path to a peer
+	/// can be established. Off by default: relayed P2P traffic doesn't fan out
+	/// like a MoQ relay, so it scales poorly and shouldn't be the silent default.
+	#[arg(
+		id = "iroh-relay",
+		long = "iroh-relay",
+		env = "MOQ_IROH_RELAY",
+		default_missing_value = "true",
+		num_args = 0..=1,
+		require_equals = true,
+		value_parser = clap::value_parser!(bool),
+	)]
+	pub relay: Option<bool>,
+
+	#[doc(hidden)]
 	#[arg(
 		id = "iroh-disable-relay",
 		long = "iroh-disable-relay",
 		env = "MOQ_IROH_DISABLE_RELAY",
+		hide = true,
 		default_missing_value = "true",
 		num_args = 0..=1,
 		require_equals = true,
 		value_parser = clap::value_parser!(bool),
 	)]
 	pub disable_relay: Option<bool>,
+
+	/// Advertise this endpoint on the local network via mDNS and discover other
+	/// MoQ endpoints the same way, implying `--iroh-enabled`. The binary decides
+	/// what to do with discovered peers; `moq` (moq-cli) meshes every one of them
+	/// into its shared origin. See the `local` module.
+	#[arg(
+		id = "iroh-discover",
+		long = "iroh-discover",
+		env = "MOQ_IROH_DISCOVER",
+		default_missing_value = "true",
+		num_args = 0..=1,
+		require_equals = true,
+		value_parser = clap::value_parser!(bool),
+	)]
+	pub discover: Option<bool>,
 }
 
 impl EndpointConfig {
+	/// Whether `--iroh-discover` is set: advertise on the local network and
+	/// discover other MoQ endpoints via mDNS.
+	pub fn discovery(&self) -> bool {
+		self.discover.unwrap_or(false)
+	}
+
+	/// Whether to use iroh's public relay servers, folding the deprecated
+	/// `--iroh-disable-relay` spelling in. The canonical flag wins when both
+	/// are given; neither means disabled.
+	fn relay_enabled(&self) -> bool {
+		self.relay
+			.or(self.disable_relay.map(|disable| !disable))
+			.unwrap_or(false)
+	}
+
 	/// Bind the iroh endpoint, applying the per-connection [`crate::quic::Client`] knobs.
 	///
 	/// iroh is a single P2P endpoint shared by both roles, so it takes the client
@@ -169,9 +229,14 @@ impl EndpointConfig {
 	/// discovery, congestion control); it has no keep-alive knob and cannot disable
 	/// GSO, so `gso = false` fails with [`Error::GsoUnsupported`].
 	pub async fn bind(self, quic: &crate::quic::Client) -> Result<Option<Endpoint>> {
-		if !self.enabled.unwrap_or(false) {
+		if !self.enabled.unwrap_or(false) && !self.discovery() {
 			return Ok(None);
 		}
+
+		if self.disable_relay.is_some() {
+			tracing::warn!("--iroh-disable-relay is deprecated; use --iroh-relay (relays are now off by default)");
+		}
+		let relay = self.relay_enabled();
 
 		let quic = quic.resolve();
 		if quic.gso_disabled() {
@@ -214,10 +279,10 @@ impl EndpointConfig {
 		}
 		transport = transport.congestion_controller_factory(congestion_factory(congestion_control(&quic)));
 
-		let mut builder = if self.disable_relay.unwrap_or(false) {
-			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-		} else {
+		let mut builder = if relay {
 			Endpoint::builder(iroh::endpoint::presets::N0)
+		} else {
+			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
 		}
 		.secret_key(secret_key)
 		.alpns(alpns)
@@ -372,6 +437,73 @@ mod tests {
 
 		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
 		assert!(delay.into_any().downcast::<noq_proto::congestion::Bbr3>().is_ok());
+	}
+
+	/// Wraps [`EndpointConfig`] (a `clap::Args`) so tests can parse CLI args.
+	#[derive(clap::Parser, serde::Deserialize, Default)]
+	#[serde(deny_unknown_fields, default)]
+	struct Test {
+		#[command(flatten)]
+		#[serde(default)]
+		iroh: EndpointConfig,
+	}
+
+	/// Relays are opt-in: off unless `--iroh-relay`, with the deprecated
+	/// `--iroh-disable-relay` spelling still honored and the canonical flag
+	/// winning when both are given.
+	#[test]
+	fn relay_defaults_off_and_folds_deprecated_flag() {
+		use clap::Parser;
+
+		let config = Test::parse_from(["test"]).iroh;
+		assert!(!config.relay_enabled());
+
+		let config = Test::parse_from(["test", "--iroh-relay"]).iroh;
+		assert!(config.relay_enabled());
+
+		let config = Test::parse_from(["test", "--iroh-disable-relay=false"]).iroh;
+		assert!(config.relay_enabled());
+
+		let config = Test::parse_from(["test", "--iroh-disable-relay"]).iroh;
+		assert!(!config.relay_enabled());
+
+		let config = Test::parse_from(["test", "--iroh-relay=false", "--iroh-disable-relay=false"]).iroh;
+		assert!(!config.relay_enabled(), "canonical flag wins over the deprecated one");
+	}
+
+	/// The TOML -> CLI merge must not clobber `Option` fields with clap defaults
+	/// (see the config-merge rule in rs/CLAUDE.md).
+	#[test]
+	fn toml_discover_and_relay_survive_update_from() {
+		use clap::Parser;
+
+		let toml = r#"
+			[iroh]
+			discover = true
+			relay = true
+		"#;
+
+		let mut config: Test = toml::from_str(toml).unwrap();
+		assert_eq!(config.iroh.discover, Some(true));
+		assert_eq!(config.iroh.relay, Some(true));
+
+		config.update_from(["test"]);
+		assert_eq!(config.iroh.discover, Some(true));
+		assert_eq!(config.iroh.relay, Some(true));
+	}
+
+	/// `--iroh-discover` parses standalone and implies the endpoint is enabled.
+	#[test]
+	fn discover_flag_parses_and_implies_enabled() {
+		use clap::Parser;
+
+		let config = Test::parse_from(["test", "--iroh-discover"]).iroh;
+		assert!(config.discovery());
+		// bind() treats discover as enabling the endpoint; mirror its check here.
+		assert!(config.enabled.unwrap_or(false) || config.discovery());
+
+		let config = Test::parse_from(["test"]).iroh;
+		assert!(!config.discovery());
 	}
 
 	/// noq's BBRv3 panics on loss, so an unset knob must land on CUBIC here even

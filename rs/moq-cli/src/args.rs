@@ -93,13 +93,22 @@ impl MoqSide {
 		.produce())
 	}
 
+	/// Whether `--iroh-discover` was given: the local-network mesh is a MoQ side
+	/// of its own, needing neither a relay dial nor a server bind.
+	pub fn discover(&self) -> bool {
+		#[cfg(feature = "iroh")]
+		return self.iroh.discovery();
+		#[cfg(not(feature = "iroh"))]
+		false
+	}
+
 	/// Reject a verb that needs the MoQ network but was given no way to reach it.
 	/// Stands in for the clap `required` the `moq` group can't carry, since
 	/// `devices` is exempt.
 	pub fn validate(&self) -> anyhow::Result<()> {
 		anyhow::ensure!(
-			self.client.connect.is_some() || self.server.bind.is_some(),
-			"a MoQ side is required: pass --client-connect <url> to dial a relay, or --server-bind <addr> to self-host"
+			self.client.connect.is_some() || self.server.bind.is_some() || self.discover(),
+			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --iroh-discover to mesh with the local network"
 		);
 		Ok(())
 	}

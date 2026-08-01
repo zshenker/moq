@@ -75,6 +75,8 @@ rust-version = "1.91"
 [workspace.dependencies]
 flate2 = "1.1"
 hang = { version = "0.20", path = "rs/hang" }
+# mDNS discovery of iroh endpoints on the local network (moq-native's `iroh` feature).
+iroh-mdns-address-lookup = "0.4"
 kio = { version = "0.5", path = "rs/kio" }
 # Permutation testing for the kio primitives (and everything built on them).
 # Only compiled under `--cfg loom`; see `just rs loom`.

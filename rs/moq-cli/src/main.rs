@@ -37,6 +37,10 @@ static ALLOC: moq_native::jemalloc::tikv_jemallocator::Jemalloc = moq_native::je
 struct Net {
 	#[cfg(feature = "iroh")]
 	iroh: Option<moq_native::iroh::Endpoint>,
+	/// `--iroh-discover`: the local mesh owns the endpoint's accept side, so the
+	/// server must not also accept on it.
+	#[cfg(feature = "iroh")]
+	discover: bool,
 }
 
 impl Net {
@@ -54,10 +58,21 @@ impl Net {
 		let server = config.init()?;
 		#[cfg(feature = "iroh")]
 		let server = match self.iroh.clone() {
-			Some(iroh) => server.with_iroh(iroh),
-			None => server,
+			Some(iroh) if !self.discover => server.with_iroh(iroh),
+			_ => server,
 		};
 		Ok(server)
+	}
+
+	/// The `--iroh-discover` mesh, connecting every local peer to the shared
+	/// Origin, or `None` when discovery is off.
+	#[cfg(feature = "iroh")]
+	fn mesh(&self, origin: &moq_net::origin::Producer) -> Option<moq_native::iroh::local::Mesh> {
+		if !self.discover {
+			return None;
+		}
+		let endpoint = self.iroh.clone()?;
+		Some(moq_native::iroh::local::Mesh::new(endpoint, origin.clone()))
 	}
 }
 
@@ -85,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
 	let net = Net {
 		#[cfg(feature = "iroh")]
 		iroh: cli.moq.iroh.clone().bind(&cli.moq.client.quic).await?,
+		#[cfg(feature = "iroh")]
+		discover: cli.moq.discover(),
 	};
 
 	#[cfg(feature = "jemalloc")]
@@ -155,6 +172,11 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 		let origin = origin.consume();
 		tasks.spawn(async move { Ok(server.serve_publish(origin).await?) });
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
+	}
+	#[cfg(feature = "iroh")]
+	if let Some(mesh) = net.mesh(&origin) {
+		moq::notify_ready();
+		tasks.spawn(async move { Ok(mesh.run().await?) });
 	}
 
 	// Foreign side: the single source.
@@ -251,6 +273,11 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 		let origin = origin.clone();
 		tasks.spawn(async move { Ok(server.serve_consume(origin).await?) });
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
+	}
+	#[cfg(feature = "iroh")]
+	if let Some(mesh) = net.mesh(&origin) {
+		moq::notify_ready();
+		tasks.spawn(async move { Ok(mesh.run().await?) });
 	}
 
 	// Foreign side: the single sink.
