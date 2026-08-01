@@ -79,6 +79,20 @@ pub struct MoqSide {
 	#[cfg(feature = "iroh")]
 	#[command(flatten)]
 	pub iroh: moq_native::iroh::EndpointConfig,
+
+	/// Discover and mesh with every other MoQ process on the local network via
+	/// mDNS: no relay, internet, or certificate setup needed. Anyone on the
+	/// network can join, so use it on networks you trust.
+	#[cfg(feature = "local")]
+	#[arg(
+		long,
+		env = "MOQ_DISCOVER",
+		help_heading = "MoQ",
+		default_missing_value = "true",
+		num_args = 0..=1,
+		require_equals = true,
+	)]
+	pub discover: Option<bool>,
 }
 
 impl MoqSide {
@@ -93,12 +107,12 @@ impl MoqSide {
 		.produce())
 	}
 
-	/// Whether `--iroh-discover` was given: the local-network mesh is a MoQ side
-	/// of its own, needing neither a relay dial nor a server bind.
+	/// Whether `--discover` was given: the local-network mesh is a MoQ side of
+	/// its own, needing neither a relay dial nor a server bind.
 	pub fn discover(&self) -> bool {
-		#[cfg(feature = "iroh")]
-		return self.iroh.discovery();
-		#[cfg(not(feature = "iroh"))]
+		#[cfg(feature = "local")]
+		return self.discover.unwrap_or(false);
+		#[cfg(not(feature = "local"))]
 		false
 	}
 
@@ -108,7 +122,7 @@ impl MoqSide {
 	pub fn validate(&self) -> anyhow::Result<()> {
 		anyhow::ensure!(
 			self.client.connect.is_some() || self.server.bind.is_some() || self.discover(),
-			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --iroh-discover to mesh with the local network"
+			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --discover to mesh with the local network"
 		);
 		Ok(())
 	}

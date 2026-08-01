@@ -78,6 +78,9 @@ pub mod quiche;
 #[cfg(feature = "iroh")]
 pub mod iroh;
 
+#[cfg(feature = "local")]
+pub mod local;
+
 /// The QUIC backend to use for connections.
 #[derive(Clone, Debug, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

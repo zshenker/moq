@@ -18,8 +18,10 @@ name = "moq"
 path = "src/main.rs"
 
 [features]
-default = ["iroh", "quinn", "websocket", "nvenc", "vaapi", "nvdec", "pipewire"]
+default = ["iroh", "local", "quinn", "websocket", "nvenc", "vaapi", "nvdec", "pipewire"]
 iroh = ["moq-native/iroh"]
+# Local-network discovery and meshing (`--discover`).
+local = ["moq-native/local"]
 jemalloc = ["moq-native/jemalloc"]
 noq = ["moq-native/noq"]
 quinn = ["moq-native/quinn"]

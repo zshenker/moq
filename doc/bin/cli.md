@@ -84,9 +84,9 @@ moq <MoQ side>  <import|export>  <endpoint> [endpoint options]
     broadcast.
   - `--server-bind <addr>` hosts MoQ sessions directly (with `--tls-generate` /
     `--tls-cert` + `--tls-key`).
-  - `--iroh-discover` meshes with every other `--iroh-discover` process on the
-    local network, no relay or internet needed. See
-    [Local Network](#local-network-iroh).
+  - `--discover` meshes with every other `--discover` process on the local
+    network via mDNS, no relay or internet needed. See
+    [Local Network](#local-network-mdns).
 
   Any combination may be given at once (e.g. dial a relay *and* accept incoming
   sessions).
@@ -117,28 +117,29 @@ ffmpeg -i video.mp4 -c copy -f mpegts - | \
     moq --client-connect https://relay.example.com/anon --broadcast my-stream.hang import ts
 ```
 
-### Local Network (iroh)
+### Local Network (mDNS)
 
-`--iroh-discover` advertises the process over mDNS and automatically connects
-to every other MoQ process on the local network, no relay, internet, or
-certificates needed. Each pair of peers opens one bidirectional session (the
-lower iroh endpoint id dials) and everything shares one set of broadcasts,
-like a miniature relay cluster:
+`--discover` advertises the process over mDNS (DNS-SD, `_moq._udp.local`) and
+automatically connects to every other MoQ process on the local network, no
+relay, internet, or certificate setup needed. Each process runs a QUIC
+listener with a generated certificate and advertises its port plus the cert's
+SHA-256 fingerprint; dialers pin the fingerprint, so sessions are encrypted
+without a CA. Each pair of peers opens one bidirectional session (a
+per-run id breaks the tie on who dials) and everything shares one set of
+broadcasts, like a miniature relay cluster:
 
 ```bash
 # On one machine: publish a stream to the LAN.
 ffmpeg -i video.mp4 -c copy -f mpegts - | \
-    moq --iroh-discover --broadcast lan-demo.hang import ts
+    moq --discover --broadcast lan-demo.hang import ts
 
 # On another: discover it and play it.
-moq --iroh-discover --broadcast lan-demo.hang export ts | mpv -
+moq --discover --broadcast lan-demo.hang export ts | mpv -
 ```
 
 It composes with the other MoQ sides, so a process can bridge the LAN mesh to
-a relay by passing `--client-connect` too. Anyone on the network can join the
-mesh, so use it on networks you trust. iroh's public relay servers stay out of
-the picture unless `--iroh-relay` is passed; pass `--iroh-secret <path>` to
-keep a stable endpoint id across restarts.
+a relay by passing `--client-connect` too. Nothing ever leaves the local
+network, and anyone on it can join the mesh, so use it on networks you trust.
 
 ### Redundant Publishers (1+1)
 

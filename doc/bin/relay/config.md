@@ -477,11 +477,6 @@ enabled = false
 
 # Path to persist the iroh secret key
 secret = "./relay-iroh-secret.key"
-
-# Fall back to iroh's public relay servers when no direct path to a peer can
-# be established. Off by default; direct (hole-punched) connections are always
-# attempted.
-relay = false
 ```
 
 ## Example Configurations
