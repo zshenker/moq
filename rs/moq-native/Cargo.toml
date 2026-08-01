@@ -28,12 +28,7 @@ qlog = ["quinn?/qlog", "web-transport-noq?/qlog"]
 # The QUIC backends pull in their crypto provider from these features (default-features
 # are off on each backend dep), so a backend without aws-lc-rs/ring has no initial cipher.
 aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs", "web-transport-noq?/aws-lc-rs"]
-iroh = [
-	"dep:web-transport-iroh",
-	"dep:web-transport-proto",
-	"dep:noq-proto",
-	"dep:iroh-mdns-address-lookup",
-]
+iroh = ["dep:web-transport-iroh", "dep:web-transport-proto", "dep:noq-proto", "dep:iroh-mdns-address-lookup"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 websocket = ["dep:qmux"]
 # Plain-TCP qmux transport (`tcp://`), no TLS. Server-side and client-side.
