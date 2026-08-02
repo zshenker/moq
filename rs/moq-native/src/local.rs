@@ -13,7 +13,10 @@
 //!
 //! Anyone on the network can advertise and join, so use this on networks you
 //! trust. Sessions are encrypted, but the advertisement is what's authenticated
-//! against, not a certificate authority.
+//! against, not a certificate authority. Membership is gated the same way: the
+//! advertisement carries a random per-run token that dialers must present, so
+//! only processes that can read the network's mDNS can join. A reachable QUIC
+//! port alone (e.g. a host with a public address) grants nothing.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -27,6 +30,9 @@ const SERVICE_TYPE: &str = "_moq._udp.local.";
 
 /// The TXT key carrying the listener certificate's hex SHA-256 fingerprint.
 const TXT_FINGERPRINT: &str = "fp";
+
+/// The TXT key carrying the join token dialers must present.
+const TXT_TOKEN: &str = "tk";
 
 /// Reconnect pacing for mesh dials, mirroring the relay's cluster dials: quick
 /// on a blip, exponential on repeated failure. A session shorter than
@@ -60,6 +66,12 @@ pub enum Error {
 	#[error("no reachable address for peer")]
 	NoAddress,
 
+	/// An inbound session did not present the advertised join token, so it
+	/// didn't come through discovery (e.g. an internet client that found the
+	/// port on a publicly reachable host).
+	#[error("peer did not present the advertised token")]
+	Unauthorized,
+
 	/// Building the dial URL failed.
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
@@ -78,6 +90,28 @@ pub struct Peer {
 	pub port: u16,
 	/// The hex SHA-256 fingerprint of the peer's certificate, to pin when dialing.
 	pub fingerprint: String,
+	/// The join token to present when dialing, proving we saw the advertisement.
+	pub token: String,
+}
+
+/// What [`Discovery`] advertises: the listener peers dial to reach this process.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Config {
+	/// The QUIC port peers dial.
+	pub port: u16,
+	/// The hex SHA-256 fingerprint of the listener's certificate, which dialers pin.
+	pub fingerprint: String,
+}
+
+impl Config {
+	/// Advertise a listener on `port` presenting the certificate with `fingerprint`.
+	pub fn new(port: u16, fingerprint: impl Into<String>) -> Self {
+		Self {
+			port,
+			fingerprint: fingerprint.into(),
+		}
+	}
 }
 
 /// A change in the set of discovered peers.
@@ -96,18 +130,21 @@ pub enum Event {
 /// is the canned dial-everyone policy. Dropping this stops advertising.
 pub struct Discovery {
 	id: String,
+	token: String,
 	daemon: ServiceDaemon,
 	events: mdns_sd::Receiver<ServiceEvent>,
 }
 
 impl Discovery {
-	/// Advertise a MoQ QUIC listener on `port` with the given certificate
-	/// `fingerprint` (hex SHA-256), and start browsing for peers.
+	/// Advertise the listener described by `config` and start browsing for peers.
 	///
-	/// The instance id is random per run, so a restarted process shows up as a
-	/// new peer.
-	pub fn new(port: u16, fingerprint: &str) -> Result<Self> {
+	/// The instance id and join token are random per run, so a restarted
+	/// process shows up as a new peer.
+	pub fn new(config: Config) -> Result<Self> {
 		let id = format!("{:016x}", rand::random::<u64>());
+		// Only readable by whoever can see this network's mDNS, which is what
+		// makes presenting it proof of membership.
+		let token = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
 		let daemon = ServiceDaemon::new()?;
 
 		let service = ServiceInfo::new(
@@ -115,20 +152,35 @@ impl Discovery {
 			&id,
 			&format!("{id}.local."),
 			"",
-			port,
-			&[(TXT_FINGERPRINT, fingerprint)][..],
+			config.port,
+			&[
+				(TXT_FINGERPRINT, config.fingerprint.as_str()),
+				(TXT_TOKEN, token.as_str()),
+			][..],
 		)?
 		.enable_addr_auto();
 		daemon.register(service)?;
 		let events = daemon.browse(SERVICE_TYPE)?;
 
-		tracing::info!(%id, port, "advertising on the local network");
-		Ok(Self { id, daemon, events })
+		tracing::info!(%id, port = config.port, "advertising on the local network");
+		Ok(Self {
+			id,
+			token,
+			daemon,
+			events,
+		})
 	}
 
 	/// This process's advertised instance id.
 	pub fn id(&self) -> &str {
 		&self.id
+	}
+
+	/// The join token this process advertised. An inbound session that doesn't
+	/// present it (as its request path, see [`Peer::token`]) didn't come
+	/// through discovery and should be rejected.
+	pub fn token(&self) -> &str {
+		&self.token
 	}
 
 	/// The next discovery event, or `None` once discovery shuts down.
@@ -144,8 +196,12 @@ impl Discovery {
 					if id == self.id {
 						continue;
 					}
-					// A record without a fingerprint can't be dialed securely; skip it.
+					// A record without a fingerprint can't be dialed securely, and one
+					// without a token can't be dialed at all; skip it.
 					let Some(fingerprint) = info.txt_properties.get_property_val_str(TXT_FINGERPRINT) else {
+						continue;
+					};
+					let Some(token) = info.txt_properties.get_property_val_str(TXT_TOKEN) else {
 						continue;
 					};
 					let mut addrs: Vec<IpAddr> = info.addresses.iter().map(|addr| addr.to_ip_addr()).collect();
@@ -157,6 +213,7 @@ impl Discovery {
 						addrs,
 						port: info.port,
 						fingerprint: fingerprint.to_string(),
+						token: token.to_string(),
 					}));
 				}
 				ServiceEvent::ServiceRemoved(_ty, fullname) => {
@@ -242,7 +299,9 @@ impl Mesh {
 			.next()
 			.ok_or(Error::NoFingerprint)?;
 
-		let mut discovery = Discovery::new(port, &fingerprint)?;
+		let mut discovery = Discovery::new(Config::new(port, fingerprint))?;
+		// The request path an authorized inbound session presents.
+		let expected = format!("/{}", discovery.token());
 		let mut dials: HashMap<String, Dial> = HashMap::new();
 		let mut tasks = tokio::task::JoinSet::new();
 
@@ -281,8 +340,9 @@ impl Mesh {
 				request = server.accept() => {
 					let Some(request) = request else { return Ok(()) };
 					let origin = self.origin.clone();
+					let expected = expected.clone();
 					tasks.spawn(async move {
-						if let Err(err) = accept_session(request, origin).await {
+						if let Err(err) = accept_session(request, origin, &expected).await {
 							tracing::warn!(%err, "local peer session ended");
 						}
 					});
@@ -326,7 +386,15 @@ fn listener_bind(bind: &str, versions: &moq_net::Versions) -> Result<crate::Serv
 }
 
 /// Accept one inbound session, attach the shared origin, and wait for it to close.
-async fn accept_session(request: crate::Request, origin: moq_net::origin::Producer) -> Result<()> {
+///
+/// The session must present the advertised join token as its request path
+/// (`expected`); the listener is reachable by anyone who can route to the
+/// port, but only discovery hands out the token.
+async fn accept_session(request: crate::Request, origin: moq_net::origin::Producer, expected: &str) -> Result<()> {
+	if request.path() != expected {
+		request.close(403).await.ok();
+		return Err(Error::Unauthorized);
+	}
 	let session = request
 		.with_publisher(&origin)
 		.with_subscriber(origin.clone())
@@ -390,9 +458,11 @@ async fn dial_addr(
 	config.tls.fingerprint = vec![peer.fingerprint.clone()];
 	config.version = versions.iter().copied().collect();
 
+	// The peer's join token rides as the request path (the SETUP for raw QUIC),
+	// proving this dial came through discovery.
 	let url: Url = match addr {
-		IpAddr::V6(_) => format!("moqt://[{addr}]:{}", peer.port),
-		IpAddr::V4(_) => format!("moqt://{addr}:{}", peer.port),
+		IpAddr::V6(_) => format!("moqt://[{addr}]:{}/{}", peer.port, peer.token),
+		IpAddr::V4(_) => format!("moqt://{addr}:{}/{}", peer.port, peer.token),
 	}
 	.parse()?;
 
@@ -452,7 +522,7 @@ mod tests {
 		let b_origin = origin_b.clone();
 		tokio::spawn(async move {
 			let request = server.accept().await.expect("accept side closed");
-			accept_session(request, b_origin).await.ok();
+			accept_session(request, b_origin, "/join-token").await.ok();
 		});
 
 		// The dial side, seeded with what discovery would have advertised.
@@ -461,6 +531,7 @@ mod tests {
 			addrs: vec!["127.0.0.1".parse().expect("valid address")],
 			port,
 			fingerprint,
+			token: "join-token".to_string(),
 		};
 		let a_origin = origin_a.clone();
 		tokio::spawn(async move {
@@ -518,6 +589,7 @@ mod tests {
 			addrs: vec!["127.0.0.1".parse().expect("valid address")],
 			port,
 			fingerprint,
+			token: "join-token".to_string(),
 		};
 
 		let result = tokio::time::timeout(
@@ -527,6 +599,54 @@ mod tests {
 		.await
 		.expect("dial timed out");
 		assert!(result.is_err(), "a version the listener excludes must not connect");
+	}
+
+	/// An inbound session that doesn't present the advertised join token is
+	/// rejected before the origin is attached: reaching the port isn't enough,
+	/// only discovery hands out the token.
+	#[tokio::test]
+	async fn rejects_missing_token() {
+		const TIMEOUT: Duration = Duration::from_secs(10);
+
+		let mut server = listener(&moq_net::Versions::all()).expect("failed to bind listener");
+		let port = server.local_addr().expect("no local addr").port();
+		let fingerprint = server
+			.certificates()
+			.fingerprints()
+			.into_iter()
+			.next()
+			.expect("no fingerprint");
+
+		let origin_b = moq_net::Origin::random().produce();
+		let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+		tokio::spawn(async move {
+			let request = server.accept().await.expect("accept side closed");
+			verdict_tx
+				.send(accept_session(request, origin_b, "/the-real-token").await)
+				.ok();
+		});
+
+		// A client that reached the port but never saw the advertisement.
+		let origin_a = moq_net::Origin::random().produce();
+		let peer = Peer {
+			id: "peer".to_string(),
+			addrs: vec!["127.0.0.1".parse().expect("valid address")],
+			port,
+			fingerprint,
+			token: "guessed-wrong".to_string(),
+		};
+		tokio::spawn(async move {
+			dial_session(&origin_a, &moq_net::Versions::all(), &peer).await.ok();
+		});
+
+		let verdict = tokio::time::timeout(TIMEOUT, verdict_rx)
+			.await
+			.expect("timed out waiting for the accept verdict")
+			.expect("accept task dropped");
+		assert!(
+			matches!(verdict, Err(Error::Unauthorized)),
+			"a session without the token must be rejected: {verdict:?}"
+		);
 	}
 
 	/// The full path: two meshes find each other over real mDNS and converge

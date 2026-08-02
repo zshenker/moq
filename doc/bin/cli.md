@@ -139,7 +139,10 @@ moq --discover --broadcast lan-demo.hang export ts | mpv -
 
 It composes with the other MoQ sides, so a process can bridge the LAN mesh to
 a relay by passing `--client-connect` too. Nothing ever leaves the local
-network, and anyone on it can join the mesh, so use it on networks you trust.
+network, and joining requires a token carried in the mDNS advertisement, so
+merely reaching the QUIC port (say, on a machine with a public address) grants
+nothing. Anyone on the local network can read the advertisement and join, so
+use it on networks you trust.
 
 ### Redundant Publishers (1+1)
 

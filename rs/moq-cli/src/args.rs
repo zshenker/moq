@@ -132,8 +132,19 @@ impl MoqSide {
 	#[cfg(feature = "capture")]
 	pub fn reject(&self, command: &str) -> anyhow::Result<()> {
 		anyhow::ensure!(
-			self.client.connect.is_none() && self.server.bind.is_none(),
-			"`{command}` runs locally and takes no MoQ side; drop --client-connect / --server-bind"
+			self.client.connect.is_none() && self.server.bind.is_none() && !self.discover(),
+			"`{command}` runs locally and takes no MoQ side; drop --client-connect / --server-bind / --discover"
+		);
+		Ok(())
+	}
+
+	/// Reject `--discover` on a verb that doesn't run the local mesh, rather
+	/// than silently ignoring it. `transcode` routes through a relay dial only.
+	#[cfg(feature = "transcode")]
+	pub fn reject_discover(&self, command: &str) -> anyhow::Result<()> {
+		anyhow::ensure!(
+			!self.discover(),
+			"`{command}` does not join the local mesh; drop --discover and pass --client-connect <url>"
 		);
 		Ok(())
 	}
