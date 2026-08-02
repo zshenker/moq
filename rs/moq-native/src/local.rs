@@ -116,6 +116,7 @@ impl Config {
 
 /// A change in the set of discovered peers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Event {
 	/// A peer appeared on the local network, or refreshed its addresses.
 	Found(Peer),
@@ -285,12 +286,11 @@ impl Mesh {
 		self
 	}
 
-	/// Discover, dial, and accept peers until interrupted (Ctrl-C).
-	///
-	/// A lost peer (mDNS expiry) has its dial aborted; a dropped session to a
-	/// still-advertised peer reconnects with backoff.
-	pub async fn run(self) -> Result<()> {
-		let mut server = listener(&self.versions)?;
+	/// Bind the listener and start advertising, failing fast on a QUIC bind or
+	/// mDNS error. Signal readiness (e.g. systemd `READY=1`) after this returns,
+	/// then drive [`Running::run`].
+	pub fn start(self) -> Result<Running> {
+		let server = listener(&self.versions)?;
 		let port = server.local_addr()?.port();
 		let fingerprint = server
 			.certificates()
@@ -299,17 +299,46 @@ impl Mesh {
 			.next()
 			.ok_or(Error::NoFingerprint)?;
 
-		let mut discovery = Discovery::new(Config::new(port, fingerprint))?;
+		let discovery = Discovery::new(Config::new(port, fingerprint))?;
+		Ok(Running {
+			origin: self.origin,
+			versions: self.versions,
+			server,
+			discovery,
+		})
+	}
+
+	/// [`start`](Self::start) and [`run`](Running::run) in one call: discover,
+	/// dial, and accept peers until interrupted (Ctrl-C).
+	pub async fn run(self) -> Result<()> {
+		self.start()?.run().await
+	}
+}
+
+/// A started [`Mesh`]: the listener is bound and the advertisement is live.
+pub struct Running {
+	origin: moq_net::origin::Producer,
+	versions: moq_net::Versions,
+	server: crate::Server,
+	discovery: Discovery,
+}
+
+impl Running {
+	/// Discover, dial, and accept peers until interrupted (Ctrl-C).
+	///
+	/// A lost peer (mDNS expiry) has its dial aborted; a dropped session to a
+	/// still-advertised peer reconnects with backoff.
+	pub async fn run(mut self) -> Result<()> {
 		// The request path an authorized inbound session presents.
-		let expected = format!("/{}", discovery.token());
+		let expected = format!("/{}", self.discovery.token());
 		let mut dials: HashMap<String, Dial> = HashMap::new();
 		let mut tasks = tokio::task::JoinSet::new();
 
 		loop {
 			tokio::select! {
-				event = discovery.recv() => match event {
+				event = self.discovery.recv() => match event {
 					Some(Event::Found(peer)) => {
-						if !discovery.should_dial(&peer.id) {
+						if !self.discovery.should_dial(&peer.id) {
 							continue;
 						}
 						match dials.get(&peer.id) {
@@ -337,7 +366,7 @@ impl Mesh {
 					}
 					None => return Ok(()),
 				},
-				request = server.accept() => {
+				request = self.server.accept() => {
 					let Some(request) = request else { return Ok(()) };
 					let origin = self.origin.clone();
 					let expected = expected.clone();
