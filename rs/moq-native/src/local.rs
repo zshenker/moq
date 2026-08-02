@@ -68,7 +68,7 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 /// A MoQ process discovered on the local network.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
 	/// The peer's advertised instance id, opaque and unique per run.
 	pub id: String,
@@ -233,7 +233,7 @@ impl Mesh {
 	/// A lost peer (mDNS expiry) has its dial aborted; a dropped session to a
 	/// still-advertised peer reconnects with backoff.
 	pub async fn run(self) -> Result<()> {
-		let mut server = listener()?;
+		let mut server = listener(&self.versions)?;
 		let port = server.local_addr()?.port();
 		let fingerprint = server
 			.certificates()
@@ -243,27 +243,37 @@ impl Mesh {
 			.ok_or(Error::NoFingerprint)?;
 
 		let mut discovery = Discovery::new(port, &fingerprint)?;
-		let mut dials: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+		let mut dials: HashMap<String, Dial> = HashMap::new();
 		let mut tasks = tokio::task::JoinSet::new();
 
 		loop {
 			tokio::select! {
 				event = discovery.recv() => match event {
 					Some(Event::Found(peer)) => {
-						if !discovery.should_dial(&peer.id) || dials.contains_key(&peer.id) {
+						if !discovery.should_dial(&peer.id) {
 							continue;
 						}
-						tracing::info!(peer = %peer.id, "discovered local peer; dialing");
+						match dials.get(&peer.id) {
+							// A periodic re-resolve with the same details; the dial stands.
+							Some(dial) if dial.peer == peer => continue,
+							// The peer re-advertised with new details (addresses, port, or
+							// a rotated cert). The old dial would retry stale state forever,
+							// so restart it against the fresh advertisement.
+							Some(dial) => {
+								tracing::info!(peer = %peer.id, "local peer re-advertised; redialing");
+								dial.handle.abort();
+							}
+							None => tracing::info!(peer = %peer.id, "discovered local peer; dialing"),
+						}
 						let origin = self.origin.clone();
 						let versions = self.versions.clone();
-						let id = peer.id.clone();
-						let handle = tasks.spawn(dial_peer(origin, versions, peer));
-						dials.insert(id, handle);
+						let handle = tasks.spawn(dial_peer(origin, versions, peer.clone()));
+						dials.insert(peer.id.clone(), Dial { handle, peer });
 					}
 					Some(Event::Lost(id)) => {
-						if let Some(handle) = dials.remove(&id) {
+						if let Some(dial) = dials.remove(&id) {
 							tracing::info!(peer = %id, "local peer expired; dropping dial");
-							handle.abort();
+							dial.handle.abort();
 						}
 					}
 					None => return Ok(()),
@@ -284,11 +294,31 @@ impl Mesh {
 	}
 }
 
+/// A dial kept alive to one peer, plus the advertisement it was spawned from
+/// so a refreshed advertisement can be told apart from a periodic re-resolve.
+struct Dial {
+	handle: tokio::task::AbortHandle,
+	peer: Peer,
+}
+
 /// The mesh's dedicated QUIC listener: a random port on every interface, with
 /// a generated certificate that peers pin by fingerprint.
-fn listener() -> Result<crate::Server> {
+///
+/// Prefers a dual-stack `[::]` socket so IPv6-only peers can connect (the OS
+/// default accepts IPv4-mapped peers too, the same assumption as the main
+/// server's `[::]:443` default), falling back to IPv4-only on hosts without
+/// IPv6.
+fn listener(versions: &moq_net::Versions) -> Result<crate::Server> {
+	match listener_bind("[::]:0", versions) {
+		Ok(server) => Ok(server),
+		Err(_) => listener_bind("0.0.0.0:0", versions),
+	}
+}
+
+fn listener_bind(bind: &str, versions: &moq_net::Versions) -> Result<crate::Server> {
 	let mut config = crate::ServerConfig {
-		bind: Some("0.0.0.0:0".to_string()),
+		bind: Some(bind.to_string()),
+		version: versions.iter().copied().collect(),
 		..Default::default()
 	};
 	config.tls.generate = vec!["moq-local".to_string()];
@@ -411,7 +441,7 @@ mod tests {
 			.expect("failed to create broadcast");
 
 		// The accept side.
-		let mut server = listener().expect("failed to bind listener");
+		let mut server = listener(&moq_net::Versions::all()).expect("failed to bind listener");
 		let port = server.local_addr().expect("no local addr").port();
 		let fingerprint = server
 			.certificates()
@@ -459,6 +489,44 @@ mod tests {
 				break;
 			}
 		}
+	}
+
+	/// The listener enforces `with_versions` on accepted sessions too, not just
+	/// on the outbound dials: a peer offering only an excluded version must be
+	/// rejected (here at the ALPN layer), whatever side of the tiebreaker the
+	/// restricted mesh lands on.
+	#[tokio::test]
+	async fn listener_enforces_versions() {
+		const TIMEOUT: Duration = Duration::from_secs(10);
+
+		let lite02: moq_net::Version = "moq-lite-02".parse().expect("valid version");
+		let lite03: moq_net::Version = "moq-lite-03".parse().expect("valid version");
+
+		let mut server = listener(&moq_net::Versions::from(vec![lite02])).expect("failed to bind listener");
+		let port = server.local_addr().expect("no local addr").port();
+		let fingerprint = server
+			.certificates()
+			.fingerprints()
+			.into_iter()
+			.next()
+			.expect("no fingerprint");
+		tokio::spawn(async move { while server.accept().await.is_some() {} });
+
+		let origin = moq_net::Origin::random().produce();
+		let peer = Peer {
+			id: "peer".to_string(),
+			addrs: vec!["127.0.0.1".parse().expect("valid address")],
+			port,
+			fingerprint,
+		};
+
+		let result = tokio::time::timeout(
+			TIMEOUT,
+			dial_addr(&origin, &moq_net::Versions::from(vec![lite03]), &peer, peer.addrs[0]),
+		)
+		.await
+		.expect("dial timed out");
+		assert!(result.is_err(), "a version the listener excludes must not connect");
 	}
 
 	/// The full path: two meshes find each other over real mDNS and converge
