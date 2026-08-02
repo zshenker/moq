@@ -25,6 +25,11 @@ use std::time::Duration;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use url::Url;
 
+// Re-exported because [`Error::Mdns`] carries its error type, so consumers can
+// name it without a direct dependency. A major bump of `mdns-sd` is therefore
+// a breaking change here.
+pub use mdns_sd;
+
 /// The DNS-SD service MoQ processes advertise under.
 const SERVICE_TYPE: &str = "_moq._udp.local.";
 
