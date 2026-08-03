@@ -3,12 +3,15 @@ use std::{
 	future::Future,
 	marker::PhantomData,
 	pin::Pin,
-	// std, not `crate::sync`: loom's Arc has no `downgrade`. See `sync.rs`.
+	// std, not `crate::sync`: loom's Arc has no `downgrade`, and `Waker::from` takes
+	// std's. See `sync.rs`.
 	sync::{Arc, OnceLock, Weak},
-	task::{Context, Poll, Waker},
+	task::{Context, Poll, Wake, Waker},
 };
 
 use smallvec::SmallVec;
+
+use crate::sync::Mutex;
 
 /// Number of slots stored inline before spilling to the heap.
 const INLINE_WAITERS: usize = 32;
@@ -240,6 +243,159 @@ impl fmt::Debug for Park {
 	}
 }
 
+/// A [`WaiterList`] that is shared, and that a [`Waker`] can wake.
+///
+/// A plain [`WaiterList`] is a field, woken by whoever owns the state around it. That
+/// is enough until the thing being waited on is a *foreign* future, which takes a
+/// `Waker` and keeps exactly one. Hand it a caller's waker and the most recent caller
+/// owns the wakeup for everybody: when that one walks away the notification goes
+/// nowhere, while the others sit parked with live registrations. Poll such a future
+/// with [`waker`](Self::waker) instead. It outlives every caller, and waking it fans
+/// out to the whole list.
+///
+/// Role-less and cloneable like [`Queue`](crate::Queue): every handle can register,
+/// wake, or hand out the waker.
+#[derive(Clone, Default)]
+pub struct Fan {
+	inner: Arc<FanInner>,
+}
+
+#[derive(Default)]
+struct FanInner {
+	state: Mutex<FanState>,
+}
+
+#[derive(Default)]
+struct FanState {
+	waiters: WaiterList,
+
+	/// How many [`Hold`]s are outstanding. While this is non-zero a wake is
+	/// recorded rather than delivered.
+	held: usize,
+
+	/// A wake arrived while held, and is still owed to the list.
+	owed: bool,
+}
+
+impl FanInner {
+	fn notify(&self) {
+		let mut waiters = {
+			let mut state = self.state.lock().expect("mutex poisoned");
+			if state.held > 0 {
+				state.owed = true;
+				return;
+			}
+
+			state.waiters.take()
+		};
+
+		// Outside the lock: a waker may resume its task inline, and a resumed waiter's
+		// first move is to register here again.
+		waiters.wake();
+	}
+}
+
+impl Wake for FanInner {
+	fn wake(self: Arc<Self>) {
+		self.notify();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		self.notify();
+	}
+}
+
+impl Fan {
+	/// Create an empty fan.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Park a waiter until the next wake.
+	///
+	/// The registration is weak and owned by the waiter, exactly as in
+	/// [`WaiterList`]: a caller that gives up releases its slot by dropping.
+	pub fn register(&self, waiter: &Waiter) {
+		waiter.register(&mut self.inner.state.lock().expect("mutex poisoned").waiters);
+	}
+
+	/// Wake every parked waiter, draining the list.
+	///
+	/// Records the wake instead while a [`hold`](Self::hold) is outstanding.
+	pub fn wake(&self) {
+		self.inner.notify();
+	}
+
+	/// A [`Waker`] that wakes every parked waiter.
+	///
+	/// Cache it rather than building one per poll: a foreign future compares the waker
+	/// it was given against the new one with `will_wake` to decide whether to
+	/// re-register, and a fresh handle each time defeats that.
+	pub fn waker(&self) -> Waker {
+		Waker::from(self.inner.clone())
+	}
+
+	/// Hold back wakes until the returned guard drops.
+	///
+	/// For polling a foreign future with [`waker`](Self::waker) while holding a lock
+	/// that the parked waiters will take when they resume. Such a future can wake its
+	/// waker *inline* — `FuturesUnordered`, for one, notifies its parent from a child's
+	/// `wake` — and delivering that would resume a waiter straight into the lock the
+	/// waker fired under.
+	///
+	/// **Drop the guard once that lock is released, not before**: the deferred wake is
+	/// delivered where the guard drops, so dropping it early puts the hazard back.
+	/// Nested holds are fine, and only the last one out delivers.
+	#[must_use = "wakes are held back only while the guard is alive"]
+	pub fn hold(&self) -> Hold {
+		self.inner.state.lock().expect("mutex poisoned").held += 1;
+
+		Hold { fan: self.clone() }
+	}
+}
+
+impl fmt::Debug for Fan {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let state = self.inner.state.lock().expect("mutex poisoned");
+		f.debug_struct("Fan")
+			.field("waiters", &state.waiters)
+			.field("held", &state.held)
+			.field("owed", &state.owed)
+			.finish()
+	}
+}
+
+/// Defers wakes on a [`Fan`] until dropped. Created by [`Fan::hold`].
+pub struct Hold {
+	fan: Fan,
+}
+
+impl Drop for Hold {
+	fn drop(&mut self) {
+		let owed = {
+			let mut state = self.fan.inner.state.lock().expect("mutex poisoned");
+			state.held -= 1;
+
+			// Still held by someone else: the wake stays owed, and the last one out
+			// delivers it.
+			match state.held {
+				0 => std::mem::take(&mut state.owed),
+				_ => false,
+			}
+		};
+
+		if owed {
+			self.fan.wake();
+		}
+	}
+}
+
+impl fmt::Debug for Hold {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Hold").finish_non_exhaustive()
+	}
+}
+
 /// Future that drives a poll function, managing waiter lifetime across polls.
 struct WaiterFn<F, R> {
 	poll: F,
@@ -280,6 +436,132 @@ where
 #[cfg(all(test, not(loom)))]
 mod tests {
 	use super::*;
+
+	/// A waker that records whether it fired.
+	#[derive(Default)]
+	struct Flag(std::sync::atomic::AtomicBool);
+
+	impl Flag {
+		fn woken(&self) -> bool {
+			self.0.load(std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+
+	impl Wake for Flag {
+		fn wake(self: Arc<Self>) {
+			self.wake_by_ref();
+		}
+
+		fn wake_by_ref(self: &Arc<Self>) {
+			self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+		}
+	}
+
+	fn flagged(fan: &Fan) -> (Arc<Flag>, Waiter) {
+		let flag = Arc::new(Flag::default());
+		let waiter = Waiter::new(Waker::from(flag.clone()));
+		fan.register(&waiter);
+
+		// The waiter goes back to the caller: the registration is weak, and dies with it.
+		(flag, waiter)
+	}
+
+	#[test]
+	fn the_waker_fans_out_to_everyone_parked() {
+		let fan = Fan::new();
+		let (first, _first_waiter) = flagged(&fan);
+		let (second, _second_waiter) = flagged(&fan);
+
+		fan.waker().wake();
+
+		assert!(first.woken() && second.woken(), "one wake must reach every waiter");
+	}
+
+	#[test]
+	fn a_departed_waiter_releases_its_slot() {
+		let fan = Fan::new();
+		let (gone, waiter) = flagged(&fan);
+		drop(waiter);
+
+		let (live, _live_waiter) = flagged(&fan);
+		fan.wake();
+
+		assert!(live.woken());
+		assert!(!gone.woken(), "a dropped waiter should have no registration left");
+	}
+
+	/// Waking while holding the fan's own lock deadlocks the moment a waker resumes its
+	/// task inline, because a resumed waiter registers again.
+	#[test]
+	fn waking_does_not_hold_the_lock() {
+		struct Reentrant(Fan);
+
+		impl Wake for Reentrant {
+			fn wake(self: Arc<Self>) {
+				self.wake_by_ref();
+			}
+
+			fn wake_by_ref(self: &Arc<Self>) {
+				self.0.register(&Waiter::noop());
+			}
+		}
+
+		let fan = Fan::new();
+		let waiter = Waiter::new(Waker::from(Arc::new(Reentrant(fan.clone()))));
+		fan.register(&waiter);
+
+		// On a deadlock this thread never finishes, so the test cannot hang.
+		let (tx, rx) = std::sync::mpsc::channel();
+		std::thread::spawn({
+			let fan = fan.clone();
+			move || {
+				fan.wake();
+				let _ = tx.send(());
+			}
+		});
+
+		rx.recv_timeout(std::time::Duration::from_secs(5))
+			.expect("wake reached a waker while holding the lock, and the wake re-entered it");
+	}
+
+	#[test]
+	fn a_held_wake_lands_when_the_hold_drops() {
+		let fan = Fan::new();
+		let (flag, _waiter) = flagged(&fan);
+
+		let hold = fan.hold();
+		fan.wake();
+		assert!(!flag.woken(), "the wake was delivered while the fan was held");
+
+		drop(hold);
+		assert!(flag.woken(), "the held wake never arrived");
+	}
+
+	#[test]
+	fn only_the_last_hold_out_delivers() {
+		let fan = Fan::new();
+		let (flag, _waiter) = flagged(&fan);
+
+		let outer = fan.hold();
+		let inner = fan.hold();
+		fan.wake();
+
+		drop(inner);
+		assert!(!flag.woken(), "a hold is still outstanding");
+
+		drop(outer);
+		assert!(flag.woken());
+	}
+
+	#[test]
+	fn a_quiet_hold_wakes_nobody() {
+		let fan = Fan::new();
+		let (flag, _waiter) = flagged(&fan);
+
+		drop(fan.hold());
+
+		assert!(!flag.woken(), "nothing woke, so nothing was owed");
+	}
 
 	#[test]
 	fn poll_future_bridges_a_std_future() {
