@@ -61,6 +61,54 @@ impl Net {
 	}
 }
 
+/// Initialized MoQ attachments that are ready to be driven.
+struct MoqAttachments {
+	client: Option<moq_native::Reconnect>,
+	server: Option<(String, moq_native::Server)>,
+	#[cfg(feature = "local")]
+	mesh: Option<moq_native::local::Running>,
+}
+
+impl MoqAttachments {
+	fn import(moq: &MoqSide, origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
+		let client = if moq.client.connect.is_some() {
+			net.client(moq.client.clone())?.publish(origin.consume())
+		} else {
+			None
+		};
+		let mut attachments = Self::new(moq, origin, net)?;
+		attachments.client = client;
+		Ok(attachments)
+	}
+
+	fn export(moq: &MoqSide, origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
+		let client = if moq.client.connect.is_some() {
+			net.client(moq.client.clone())?.consume(origin.clone())
+		} else {
+			None
+		};
+		let mut attachments = Self::new(moq, origin, net)?;
+		attachments.client = client;
+		Ok(attachments)
+	}
+
+	fn new(moq: &MoqSide, origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
+		let server = match moq.server.bind.clone() {
+			Some(bind) => Some((bind, net.server(moq.server.clone())?)),
+			None => None,
+		};
+		#[cfg(feature = "local")]
+		let mesh = moq.mesh(origin)?;
+
+		Ok(Self {
+			client: None,
+			server,
+			#[cfg(feature = "local")]
+			mesh,
+		})
+	}
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	// TODO: It would be nice to remove this and rely on feature flags only.
@@ -143,11 +191,12 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 	#[cfg(feature = "capture")]
 	let mut send_bandwidth = None;
 
+	// Initialize every configured MoQ attachment before signaling readiness.
+	let attachments = MoqAttachments::import(&moq, &origin, &net)?;
+	moq::notify_ready();
+
 	// MoQ side: publish the Origin outward.
-	if moq.client.connect.is_some()
-		&& let Some(reconnect) = net.client(moq.client.clone())?.publish(origin.consume())
-	{
-		moq::notify_ready();
+	if let Some(reconnect) = attachments.client {
 		// Read before the handle moves into the task. This consumer is
 		// persistent: it survives reconnects, reading `None` while down, so it
 		// can be wired up before anything connects.
@@ -157,17 +206,14 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 		}
 		tasks.spawn(async move { Ok(reconnect.closed().await?) });
 	}
-	if let Some(web_bind) = moq.server.bind.clone() {
-		let server = net.server(moq.server.clone())?;
+	if let Some((web_bind, server)) = attachments.server {
 		let certificates = server.certificates();
-		moq::notify_ready();
 		let origin = origin.consume();
 		tasks.spawn(async move { Ok(server.serve_publish(origin).await?) });
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
 	}
 	#[cfg(feature = "local")]
-	if let Some(mesh) = moq.mesh(&origin)? {
-		moq::notify_ready();
+	if let Some(mesh) = attachments.mesh {
 		tasks.spawn(async move { Ok(mesh.run().await?) });
 	}
 
@@ -251,24 +297,22 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 		reject_listener_cors(&rtc.cors, "export rtc")?;
 	}
 
+	// Initialize every configured MoQ attachment before signaling readiness.
+	let attachments = MoqAttachments::export(&moq, &origin, &net)?;
+	moq::notify_ready();
+
 	// MoQ side: fill the Origin.
-	if moq.client.connect.is_some()
-		&& let Some(reconnect) = net.client(moq.client.clone())?.consume(origin.clone())
-	{
-		moq::notify_ready();
+	if let Some(reconnect) = attachments.client {
 		tasks.spawn(async move { Ok(reconnect.closed().await?) });
 	}
-	if let Some(web_bind) = moq.server.bind.clone() {
-		let server = net.server(moq.server.clone())?;
+	if let Some((web_bind, server)) = attachments.server {
 		let certificates = server.certificates();
-		moq::notify_ready();
 		let origin = origin.clone();
 		tasks.spawn(async move { Ok(server.serve_consume(origin).await?) });
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
 	}
 	#[cfg(feature = "local")]
-	if let Some(mesh) = moq.mesh(&origin)? {
-		moq::notify_ready();
+	if let Some(mesh) = attachments.mesh {
 		tasks.spawn(async move { Ok(mesh.run().await?) });
 	}
 
@@ -389,4 +433,45 @@ fn reject_listener_cors(cors: &crate::web::Cors, endpoint: &str) -> anyhow::Resu
 		"`--cors-origin` only applies to `{endpoint} --listen`"
 	);
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn attachments_fail_as_a_unit_before_readiness() {
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve a server port");
+		let bind = occupied.local_addr().expect("bound address").to_string();
+		let cli = Cli::try_parse_from([
+			"moq",
+			"--client-connect",
+			"https://relay.example.com",
+			"--server-bind",
+			&bind,
+			"--tls-generate",
+			"localhost",
+			"import",
+			"ts",
+		])
+		.expect("valid combined MoQ attachments");
+		let origin = cli.moq.origin().expect("valid origin");
+		let net = Net {
+			#[cfg(feature = "iroh")]
+			iroh: None,
+		};
+
+		let err = MoqAttachments::import(&cli.moq, &origin, &net)
+			.err()
+			.expect("the occupied server bind must fail the combined initialization");
+		assert!(
+			err.chain().any(|source| {
+				source
+					.downcast_ref::<std::io::Error>()
+					.is_some_and(|source| source.kind() == std::io::ErrorKind::AddrInUse)
+			}),
+			"{err:#}"
+		);
+	}
 }

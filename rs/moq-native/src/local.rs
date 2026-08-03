@@ -36,9 +36,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use subtle::ConstantTimeEq;
 use url::Url;
 
-// Re-exported because [`Error::Mdns`] carries its error type, so consumers can
-// name it without a direct dependency. A major bump of `mdns-sd` is therefore
-// a breaking change here.
+/// Re-exported because [`Error::Mdns`] exposes its error type to consumers.
 pub use mdns_sd;
 
 /// The DNS-SD service MoQ processes advertise under.
