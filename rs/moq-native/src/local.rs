@@ -1,15 +1,12 @@
 //! Local-network discovery and meshing, no relay, internet, or certificate
 //! setup needed.
 //!
-//! [`Discovery`] advertises this process as a `_moq._udp.local.` DNS-SD service
-//! and reports every other MoQ process heard on the network. The advertisement
-//! carries a QUIC port and the SHA-256 fingerprint of a generated certificate,
-//! so a dialer pins the fingerprint instead of needing a CA. [`Mesh`] is the
-//! batteries-included layer on top: it runs a dedicated QUIC listener, opens
-//! one bidirectional session per discovered peer, and attaches every session
-//! (dialed and accepted) to a single shared [`moq_net::origin::Producer`], so
-//! all peers see each other's broadcasts. Loop prevention comes from the hop
-//! list carried on each broadcast's route, exactly like a relay cluster.
+//! [`Mesh`] advertises this process as a `_moq._udp.local.` DNS-SD service,
+//! runs a dedicated QUIC listener, opens one bidirectional session per
+//! discovered peer, and attaches every session to a shared
+//! [`moq_net::origin::Producer`]. The advertisement carries the QUIC port and
+//! generated certificate fingerprint, so peers need no certificate authority.
+//! Loop prevention comes from each broadcast's route, like a relay cluster.
 //!
 //! Anyone on the network can advertise and join, so use this on networks you
 //! trust. Sessions are encrypted, but the advertisement is what's authenticated
@@ -18,12 +15,12 @@
 //! only processes that can read the network's mDNS can join. A reachable QUIC
 //! port alone (e.g. a host with a public address) grants nothing.
 //!
-//! On networks you don't fully trust, set a pre-shared secret
-//! ([`Config::with_secret`]): membership then requires knowing the secret, not
-//! just reading mDNS. Both sides prove knowledge with HMAC-SHA256 proofs bound
-//! to each listener's nonce and certificate fingerprint, so the secret never
-//! travels the network and a proof presented to one peer replays nowhere else.
-//! Peers with a different secret (or none) are mutually invisible.
+//! On networks you don't fully trust, use [`Mesh::with_secret`]. Membership
+//! then requires knowing a [`Secret`], not just reading mDNS. Both sides prove
+//! knowledge with HMAC-SHA256 proofs bound to each listener's nonce and
+//! certificate fingerprint, so the secret never travels the network and a
+//! proof presented to one peer replays nowhere else. Peers with a different
+//! secret (or none) are mutually invisible.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,9 +32,6 @@ use hmac::{KeyInit, Mac};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use subtle::ConstantTimeEq;
 use url::Url;
-
-/// Re-exported because [`Error::Mdns`] exposes its error type to consumers.
-pub use mdns_sd;
 
 /// The DNS-SD service MoQ processes advertise under.
 const SERVICE_TYPE: &str = "_moq._udp.local.";
@@ -67,49 +61,44 @@ const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const DIAL_STABLE: Duration = Duration::from_secs(10);
 
-/// Errors from local-network discovery and meshing.
+/// An error while configuring or running a local mesh.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {
-	/// The mDNS daemon failed (e.g. no multicast-capable interface).
+#[error(transparent)]
+pub struct Error(ErrorKind);
+
+#[derive(Debug, thiserror::Error)]
+enum ErrorKind {
 	#[error(transparent)]
 	Mdns(#[from] mdns_sd::Error),
 
-	/// Building or driving a QUIC endpoint failed.
 	#[error(transparent)]
 	Transport(#[from] crate::Error),
 
-	/// The MoQ handshake or an established session failed.
 	#[error(transparent)]
 	Moq(#[from] moq_net::Error),
 
-	/// The mesh listener produced no certificate fingerprint to advertise.
 	#[error("no certificate fingerprint to advertise")]
 	NoFingerprint,
 
-	/// A dial ran out of advertised addresses without connecting.
 	#[error("no reachable address for peer")]
 	NoAddress,
 
-	/// An inbound session did not present the advertised join token, so it
-	/// didn't come through discovery (e.g. an internet client that found the
-	/// port on a publicly reachable host).
 	#[error("peer did not present the advertised token")]
 	Unauthorized,
 
-	/// A shared secret was empty and would provide no authentication.
 	#[error("local discovery secret must not be empty")]
 	EmptySecret,
 
-	/// None of the configured protocol versions can carry the mesh join token.
 	#[error("local mesh requires a protocol version that carries a request path")]
 	NoRequestPathVersion,
+
 	/// Building the dial URL failed.
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
 }
 
 type Result<T> = std::result::Result<T, Error>;
+type InternalResult<T> = std::result::Result<T, ErrorKind>;
 
 /// A validated pre-shared secret for authenticating local mesh membership.
 #[derive(Clone, PartialEq, Eq)]
@@ -120,7 +109,7 @@ impl Secret {
 	pub fn new(secret: impl Into<String>) -> Result<Self> {
 		let secret = secret.into();
 		if secret.is_empty() {
-			return Err(Error::EmptySecret);
+			return Err(Error(ErrorKind::EmptySecret));
 		}
 		Ok(Self(secret))
 	}
@@ -146,16 +135,15 @@ impl FromStr for Secret {
 
 /// A MoQ process discovered on the local network.
 #[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Peer {
+struct Peer {
 	/// The peer's advertised instance id, opaque and unique per run.
-	pub id: String,
+	id: String,
 	/// The socket addresses the peer advertised, including IPv6 scope ids.
-	pub addrs: Vec<SocketAddr>,
+	addrs: Vec<SocketAddr>,
 	/// The hex SHA-256 fingerprint of the peer's certificate, to pin when dialing.
-	pub fingerprint: String,
+	fingerprint: String,
 	/// The join token to present when dialing, proving we saw the advertisement.
-	pub token: String,
+	token: String,
 }
 
 impl fmt::Debug for Peer {
@@ -172,41 +160,33 @@ impl fmt::Debug for Peer {
 
 /// What [`Discovery`] advertises: the listener peers dial to reach this process.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct Config {
+struct Config {
 	/// The QUIC port peers dial.
-	pub port: u16,
+	port: u16,
 	/// The hex SHA-256 fingerprint of the listener's certificate, which dialers pin.
-	pub fingerprint: String,
+	fingerprint: String,
 	/// Require this pre-shared secret to join, instead of trusting everyone on
 	/// the network. Peers with a different secret (or none) are mutually
 	/// invisible. The advertisement carries an HMAC over a public nonce, so a
 	/// weak secret can be brute-forced offline by anyone on the network; pick a
 	/// strong one.
-	pub secret: Option<Secret>,
+	secret: Option<Secret>,
 }
 
 impl Config {
 	/// Advertise a listener on `port` presenting the certificate with `fingerprint`.
-	pub fn new(port: u16, fingerprint: impl Into<String>) -> Self {
+	fn new(port: u16, fingerprint: impl Into<String>) -> Self {
 		Self {
 			port,
 			fingerprint: fingerprint.into(),
 			secret: None,
 		}
 	}
-
-	/// Require [`secret`](Self::secret) to join the mesh.
-	pub fn with_secret(mut self, secret: Secret) -> Self {
-		self.secret = Some(secret);
-		self
-	}
 }
 
 /// A change in the set of discovered peers.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
-pub enum Event {
+enum Event {
 	/// A peer appeared on the local network, or refreshed its addresses.
 	Found(Peer),
 	/// A previously discovered peer (by id) stopped advertising.
@@ -218,7 +198,7 @@ pub enum Event {
 /// Pure discovery: what to do with peers (dial, list, filter) stays with the
 /// caller, and [`Discovery::should_dial`] offers the pair tiebreaker. [`Mesh`]
 /// is the canned dial-everyone policy. Dropping this stops advertising.
-pub struct Discovery {
+struct Discovery {
 	id: String,
 	token: String,
 	secret: Option<Secret>,
@@ -231,7 +211,7 @@ impl Discovery {
 	///
 	/// The instance id and join token are random per run, so a restarted
 	/// process shows up as a new peer.
-	pub fn new(config: Config) -> Result<Self> {
+	fn new(config: Config) -> InternalResult<Self> {
 		let id = format!("{:016x}", rand::random::<u64>());
 		let random = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
 
@@ -273,22 +253,17 @@ impl Discovery {
 		})
 	}
 
-	/// This process's advertised instance id.
-	pub fn id(&self) -> &str {
-		&self.id
-	}
-
 	/// The join token this process advertised. An inbound session that doesn't
 	/// present it (as its request path, see [`Peer::token`]) didn't come
 	/// through discovery and should be rejected.
-	pub fn token(&self) -> &str {
+	fn token(&self) -> &str {
 		&self.token
 	}
 
 	/// The next discovery event, or `None` once discovery shuts down.
 	///
 	/// A peer already dialed may be reported again when its addresses change.
-	pub async fn recv(&mut self) -> Option<Event> {
+	async fn recv(&mut self) -> Option<Event> {
 		while let Ok(event) = self.events.recv_async().await {
 			match event {
 				ServiceEvent::ServiceResolved(info) => {
@@ -346,7 +321,7 @@ impl Discovery {
 	/// bidirectional, so one connection suffices: the lower id dials and the
 	/// higher accepts. Deterministic on both sides with no coordination, like
 	/// the relay cluster's URL tiebreaker.
-	pub fn should_dial(&self, remote: &str) -> bool {
+	fn should_dial(&self, remote: &str) -> bool {
 		should_dial(&self.id, remote)
 	}
 }
@@ -428,11 +403,11 @@ fn instance_id(fullname: &str) -> Option<&str> {
 /// Connects every discovered local peer to one shared origin.
 ///
 /// Runs its own QUIC listener (a random port with a generated, fingerprint-
-/// pinned certificate), advertises it via [`Discovery`], and opens a single
-/// bidirectional MoQ session per peer (the lower id dials, see
-/// [`Discovery::should_dial`]). Every session, dialed or accepted, both
-/// publishes the origin and ingests the peer's broadcasts into it, so the
-/// whole network converges on one set of broadcasts with no relay involved.
+/// pinned certificate), advertises it with mDNS, and opens a single
+/// bidirectional MoQ session per peer. The lower instance id dials. Every
+/// session, dialed or accepted, both publishes the origin and ingests the
+/// peer's broadcasts into it, so the whole network converges on one set of
+/// broadcasts with no relay involved.
 pub struct Mesh {
 	origin: moq_net::origin::Producer,
 	versions: moq_net::Versions,
@@ -459,7 +434,7 @@ impl Mesh {
 	}
 
 	/// Require a pre-shared secret to join, instead of trusting everyone on
-	/// the network; see [`Config::secret`].
+	/// the network.
 	pub fn with_secret(mut self, secret: Secret) -> Self {
 		self.secret = Some(secret);
 		self
@@ -469,6 +444,10 @@ impl Mesh {
 	/// mDNS error. Signal readiness (e.g. systemd `READY=1`) after this returns,
 	/// then drive [`Running::run`].
 	pub fn start(self) -> Result<Running> {
+		self.start_inner().map_err(Error)
+	}
+
+	fn start_inner(self) -> InternalResult<Running> {
 		let versions = authenticated_versions(&self.versions)?;
 		let server = listener(&versions)?;
 		let port = server.local_addr()?.port();
@@ -477,7 +456,7 @@ impl Mesh {
 			.fingerprints()
 			.into_iter()
 			.next()
-			.ok_or(Error::NoFingerprint)?;
+			.ok_or(ErrorKind::NoFingerprint)?;
 
 		let mut config = Config::new(port, fingerprint);
 		config.secret = self.secret;
@@ -572,7 +551,7 @@ struct Dial {
 }
 
 /// Keep only protocol versions that can carry the membership token in-band.
-fn authenticated_versions(versions: &moq_net::Versions) -> Result<moq_net::Versions> {
+fn authenticated_versions(versions: &moq_net::Versions) -> InternalResult<moq_net::Versions> {
 	let versions: Vec<_> = versions
 		.iter()
 		.copied()
@@ -583,7 +562,7 @@ fn authenticated_versions(versions: &moq_net::Versions) -> Result<moq_net::Versi
 		})
 		.collect();
 	if versions.is_empty() {
-		return Err(Error::NoRequestPathVersion);
+		return Err(ErrorKind::NoRequestPathVersion);
 	}
 	Ok(moq_net::Versions::from(versions))
 }
@@ -595,7 +574,7 @@ fn authenticated_versions(versions: &moq_net::Versions) -> Result<moq_net::Versi
 /// default accepts IPv4-mapped peers too, the same assumption as the main
 /// server's `[::]:443` default), falling back to IPv4-only on hosts without
 /// IPv6.
-fn listener(versions: &moq_net::Versions) -> Result<crate::Server> {
+fn listener(versions: &moq_net::Versions) -> InternalResult<crate::Server> {
 	match listener_bind("[::]:0", versions) {
 		Ok(server) => Ok(server),
 		Err(err) => {
@@ -605,7 +584,7 @@ fn listener(versions: &moq_net::Versions) -> Result<crate::Server> {
 	}
 }
 
-fn listener_bind(bind: &str, versions: &moq_net::Versions) -> Result<crate::Server> {
+fn listener_bind(bind: &str, versions: &moq_net::Versions) -> InternalResult<crate::Server> {
 	let mut config = crate::ServerConfig {
 		bind: Some(bind.to_string()),
 		version: versions.iter().copied().collect(),
@@ -620,10 +599,14 @@ fn listener_bind(bind: &str, versions: &moq_net::Versions) -> Result<crate::Serv
 /// The session must present the advertised join token as its request path
 /// (`expected`); the listener is reachable by anyone who can route to the
 /// port, but only discovery hands out the token.
-async fn accept_session(request: crate::Request, origin: moq_net::origin::Producer, expected: &str) -> Result<()> {
+async fn accept_session(
+	request: crate::Request,
+	origin: moq_net::origin::Producer,
+	expected: &str,
+) -> InternalResult<()> {
 	if !ct_eq(request.path(), expected) {
 		request.close(403).await.ok();
-		return Err(Error::Unauthorized);
+		return Err(ErrorKind::Unauthorized);
 	}
 	let session = request
 		.with_publisher(&origin)
@@ -663,8 +646,8 @@ impl Dialer {
 	}
 
 	/// Dial `peer` on the first reachable advertised address and wait for it to close.
-	async fn connect(&self, peer: &Peer) -> Result<()> {
-		let mut last: Option<Error> = None;
+	async fn connect(&self, peer: &Peer) -> InternalResult<()> {
+		let mut last: Option<ErrorKind> = None;
 
 		for addr in &peer.addrs {
 			let session = match self.connect_addr(peer, *addr).await {
@@ -677,11 +660,11 @@ impl Dialer {
 			return Err(session.closed().await.into());
 		}
 
-		Err(last.unwrap_or(Error::NoAddress))
+		Err(last.unwrap_or(ErrorKind::NoAddress))
 	}
 
 	/// One raw QUIC attempt to `addr`, pinning the peer's fingerprint.
-	async fn connect_addr(&self, peer: &Peer, addr: SocketAddr) -> Result<moq_net::Session> {
+	async fn connect_addr(&self, peer: &Peer, addr: SocketAddr) -> InternalResult<moq_net::Session> {
 		let mut config = crate::ClientConfig {
 			// Match the bind family to the target so a v4-only host can dial.
 			bind: match addr {
@@ -777,7 +760,7 @@ mod tests {
 
 	#[test]
 	fn secret_rejects_empty_values() {
-		assert!(matches!(Secret::new(""), Err(Error::EmptySecret)));
+		assert!(matches!(Secret::new(""), Err(Error(ErrorKind::EmptySecret))));
 		assert_eq!(format!("{:?}", Secret::new("swordfish").unwrap()), "Secret([redacted])");
 	}
 
@@ -791,7 +774,7 @@ mod tests {
 		);
 		assert!(matches!(
 			authenticated_versions(&pathless),
-			Err(Error::NoRequestPathVersion)
+			Err(ErrorKind::NoRequestPathVersion)
 		));
 
 		let lite05 = "moq-lite-05".parse().expect("valid version");
@@ -972,7 +955,7 @@ mod tests {
 			.expect("timed out waiting for the accept verdict")
 			.expect("accept task dropped");
 		assert!(
-			matches!(verdict, Err(Error::Unauthorized)),
+			matches!(verdict, Err(ErrorKind::Unauthorized)),
 			"a session without the token must be rejected: {verdict:?}"
 		);
 	}
