@@ -100,6 +100,10 @@ pub enum Error {
 	/// A shared secret was empty and would provide no authentication.
 	#[error("local discovery secret must not be empty")]
 	EmptySecret,
+
+	/// None of the configured protocol versions can carry the mesh join token.
+	#[error("local mesh requires a protocol version that carries a request path")]
+	NoRequestPathVersion,
 	/// Building the dial URL failed.
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
@@ -446,6 +450,9 @@ impl Mesh {
 	}
 
 	/// Restrict the MoQ protocol versions offered on mesh sessions.
+	///
+	/// Versions that cannot carry the join token as a request path are omitted.
+	/// Starting the mesh fails when none of the configured versions remain.
 	pub fn with_versions(mut self, versions: moq_net::Versions) -> Self {
 		self.versions = versions;
 		self
@@ -462,7 +469,8 @@ impl Mesh {
 	/// mDNS error. Signal readiness (e.g. systemd `READY=1`) after this returns,
 	/// then drive [`Running::run`].
 	pub fn start(self) -> Result<Running> {
-		let server = listener(&self.versions)?;
+		let versions = authenticated_versions(&self.versions)?;
+		let server = listener(&versions)?;
 		let port = server.local_addr()?.port();
 		let fingerprint = server
 			.certificates()
@@ -476,7 +484,7 @@ impl Mesh {
 		let discovery = Discovery::new(config)?;
 		Ok(Running {
 			origin: self.origin,
-			versions: self.versions,
+			versions,
 			server,
 			discovery,
 		})
@@ -561,6 +569,23 @@ impl Running {
 struct Dial {
 	handle: tokio::task::AbortHandle,
 	peer: Peer,
+}
+
+/// Keep only protocol versions that can carry the membership token in-band.
+fn authenticated_versions(versions: &moq_net::Versions) -> Result<moq_net::Versions> {
+	let versions: Vec<_> = versions
+		.iter()
+		.copied()
+		.filter(|version| match version {
+			moq_net::Version::Lite(version) => version.has_setup_stream(),
+			moq_net::Version::Ietf(_) => true,
+			_ => true,
+		})
+		.collect();
+	if versions.is_empty() {
+		return Err(Error::NoRequestPathVersion);
+	}
+	Ok(moq_net::Versions::from(versions))
 }
 
 /// The mesh's dedicated QUIC listener: a random port on every interface, with
@@ -754,6 +779,26 @@ mod tests {
 	fn secret_rejects_empty_values() {
 		assert!(matches!(Secret::new(""), Err(Error::EmptySecret)));
 		assert_eq!(format!("{:?}", Secret::new("swordfish").unwrap()), "Secret([redacted])");
+	}
+
+	#[test]
+	fn membership_versions_require_an_in_band_request_path() {
+		let pathless = moq_net::Versions::from(
+			["moq-lite-01", "moq-lite-02", "moq-lite-03", "moq-lite-04"]
+				.into_iter()
+				.map(|version| version.parse().expect("valid version"))
+				.collect::<Vec<_>>(),
+		);
+		assert!(matches!(
+			authenticated_versions(&pathless),
+			Err(Error::NoRequestPathVersion)
+		));
+
+		let lite05 = "moq-lite-05".parse().expect("valid version");
+		let ietf14 = "moq-transport-14".parse().expect("valid version");
+		let mixed = moq_net::Versions::from(pathless.iter().copied().chain([lite05, ietf14]).collect::<Vec<_>>());
+		let authenticated = authenticated_versions(&mixed).expect("path-capable versions remain");
+		assert_eq!(authenticated.iter().copied().collect::<Vec<_>>(), [lite05, ietf14]);
 	}
 
 	#[test]
