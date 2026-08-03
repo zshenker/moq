@@ -4447,6 +4447,7 @@ dependencies = [
  "moq-video",
  "rustls",
  "sd-notify",
+ "tempfile",
  "tokio",
  "tower-http 0.7.0",
  "tracing",

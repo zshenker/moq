@@ -1,4 +1,4 @@
-//! Local-network discovery and meshing, no relay, internet, or certificate
+//! LAN discovery and meshing, no relay, internet, or certificate
 //! setup needed.
 //!
 //! [`Mesh`] advertises this process as a `_moq._udp.local.` DNS-SD service,
@@ -16,11 +16,11 @@
 //! port alone (e.g. a host with a public address) grants nothing.
 //!
 //! On networks you don't fully trust, use [`Mesh::with_secret`]. Membership
-//! then requires knowing a [`Secret`], not just reading mDNS. Both sides prove
-//! knowledge with HMAC-SHA256 proofs bound to each listener's nonce and
-//! certificate fingerprint, so the secret never travels the network and a
-//! proof presented to one peer replays nowhere else. Peers with a different
-//! secret (or none) are mutually invisible.
+//! then requires knowing a random 32-byte [`Secret`], not just reading mDNS.
+//! Both sides prove knowledge with HMAC-SHA256 proofs bound to each listener's
+//! nonce, certificate fingerprint, and advertised node identity, so the secret
+//! never travels the network and a proof presented to one peer replays nowhere
+//! else. Peers with a different secret (or none) are mutually invisible.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -48,10 +48,13 @@ const TXT_NONCE: &str = "n";
 /// The TXT key carrying the listener's proof that it knows the secret.
 const TXT_ADVERT: &str = "a";
 
+/// The TXT key carrying the cluster node's canonical URL when configured.
+const TXT_NODE: &str = "node";
+
 /// Domain separators for the two secret proofs, so a captured proof of one
 /// role can never stand in for the other.
-const CONTEXT_ADVERT: &str = "moq-local-advert";
-const CONTEXT_DIAL: &str = "moq-local-dial";
+const CONTEXT_ADVERT: &str = "moq-cluster-lan-advert";
+const CONTEXT_DIAL: &str = "moq-cluster-lan-dial";
 
 /// Reconnect pacing for mesh dials, mirroring the relay's cluster dials: quick
 /// on a blip, exponential on repeated failure. A session shorter than
@@ -61,7 +64,7 @@ const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const DIAL_STABLE: Duration = Duration::from_secs(10);
 
-/// An error while configuring or running a local mesh.
+/// An error while configuring or running a LAN mesh.
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct Error(ErrorKind);
@@ -86,10 +89,10 @@ enum ErrorKind {
 	#[error("peer did not present the advertised token")]
 	Unauthorized,
 
-	#[error("local discovery secret must not be empty")]
-	EmptySecret,
+	#[error("cluster LAN secret must be exactly 32 bytes encoded as 64 hexadecimal characters")]
+	InvalidSecret,
 
-	#[error("local mesh requires a protocol version that carries a request path")]
+	#[error("LAN mesh requires a protocol version that carries a request path")]
 	NoRequestPathVersion,
 
 	/// Building the dial URL failed.
@@ -100,21 +103,22 @@ enum ErrorKind {
 type Result<T> = std::result::Result<T, Error>;
 type InternalResult<T> = std::result::Result<T, ErrorKind>;
 
-/// A validated pre-shared secret for authenticating local mesh membership.
+/// A validated 32-byte pre-shared key for authenticating LAN mesh membership.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
+pub struct Secret([u8; 32]);
 
 impl Secret {
-	/// Validate a non-empty shared secret.
-	pub fn new(secret: impl Into<String>) -> Result<Self> {
-		let secret = secret.into();
-		if secret.is_empty() {
-			return Err(Error(ErrorKind::EmptySecret));
+	/// Decode a key from exactly 64 hexadecimal characters.
+	pub fn new(secret: impl AsRef<str>) -> Result<Self> {
+		let secret = secret.as_ref();
+		let mut key = [0; 32];
+		if secret.len() != key.len() * 2 || hex::decode_to_slice(secret, &mut key).is_err() {
+			return Err(Error(ErrorKind::InvalidSecret));
 		}
-		Ok(Self(secret))
+		Ok(Self(key))
 	}
 
-	fn as_str(&self) -> &str {
+	fn as_bytes(&self) -> &[u8; 32] {
 		&self.0
 	}
 }
@@ -133,10 +137,10 @@ impl FromStr for Secret {
 	}
 }
 
-/// A MoQ process discovered on the local network.
+/// A MoQ process discovered on the LAN.
 #[derive(Clone, PartialEq, Eq)]
 struct Peer {
-	/// The peer's advertised instance id, opaque and unique per run.
+	/// The stable node URL when advertised, otherwise the per-run service instance.
 	id: String,
 	/// The socket addresses the peer advertised, including IPv6 scope ids.
 	addrs: Vec<SocketAddr>,
@@ -171,6 +175,8 @@ struct Config {
 	/// weak secret can be brute-forced offline by anyone on the network; pick a
 	/// strong one.
 	secret: Option<Secret>,
+	/// The canonical cluster node URL used as the stable mesh identity.
+	node: Option<String>,
 }
 
 impl Config {
@@ -180,6 +186,7 @@ impl Config {
 			port,
 			fingerprint: fingerprint.into(),
 			secret: None,
+			node: None,
 		}
 	}
 }
@@ -187,21 +194,23 @@ impl Config {
 /// A change in the set of discovered peers.
 #[derive(Clone, Debug)]
 enum Event {
-	/// A peer appeared on the local network, or refreshed its addresses.
+	/// A peer appeared on the LAN, or refreshed its addresses.
 	Found(Peer),
 	/// A previously discovered peer (by id) stopped advertising.
 	Lost(String),
 }
 
-/// Advertises this process on the local network and discovers the others.
+/// Advertises this process on the LAN and discovers the others.
 ///
 /// Pure discovery: what to do with peers (dial, list, filter) stays with the
 /// caller, and [`Discovery::should_dial`] offers the pair tiebreaker. [`Mesh`]
 /// is the canned dial-everyone policy. Dropping this stops advertising.
 struct Discovery {
+	instance: String,
 	id: String,
 	token: String,
 	secret: Option<Secret>,
+	peers: HashMap<String, String>,
 	daemon: ServiceDaemon,
 	events: mdns_sd::Receiver<ServiceEvent>,
 }
@@ -209,14 +218,19 @@ struct Discovery {
 impl Discovery {
 	/// Advertise the listener described by `config` and start browsing for peers.
 	///
-	/// The instance id and join token are random per run, so a restarted
-	/// process shows up as a new peer.
+	/// The service instance and join token are random per run. When configured,
+	/// the cluster node URL supplies the stable identity used for deduplication
+	/// and the dial tiebreaker.
 	fn new(config: Config) -> InternalResult<Self> {
-		let id = format!("{:016x}", rand::random::<u64>());
+		let instance = format!("{:016x}", rand::random::<u64>());
+		let id = config.node.clone().unwrap_or_else(|| instance.clone());
 		let random = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
 
 		let mut txt = std::collections::HashMap::new();
 		txt.insert(TXT_FINGERPRINT.to_string(), config.fingerprint.clone());
+		if let Some(node) = &config.node {
+			txt.insert(TXT_NODE.to_string(), node.clone());
+		}
 		let token = match &config.secret {
 			// Only readable by whoever can see this network's mDNS, which is
 			// what makes presenting it proof of membership.
@@ -231,23 +245,44 @@ impl Discovery {
 				txt.insert(TXT_NONCE.to_string(), random.clone());
 				txt.insert(
 					TXT_ADVERT.to_string(),
-					proof(secret, CONTEXT_ADVERT, &random, &config.fingerprint),
+					proof(
+						secret,
+						CONTEXT_ADVERT,
+						&random,
+						&config.fingerprint,
+						config.node.as_deref(),
+					),
 				);
-				proof(secret, CONTEXT_DIAL, &random, &config.fingerprint)
+				proof(
+					secret,
+					CONTEXT_DIAL,
+					&random,
+					&config.fingerprint,
+					config.node.as_deref(),
+				)
 			}
 		};
 
 		let daemon = ServiceDaemon::new()?;
-		let service =
-			ServiceInfo::new(SERVICE_TYPE, &id, &format!("{id}.local."), "", config.port, txt)?.enable_addr_auto();
+		let service = ServiceInfo::new(
+			SERVICE_TYPE,
+			&instance,
+			&format!("{instance}.local."),
+			"",
+			config.port,
+			txt,
+		)?
+		.enable_addr_auto();
 		daemon.register(service)?;
 		let events = daemon.browse(SERVICE_TYPE)?;
 
-		tracing::info!(%id, port = config.port, "advertising on the local network");
+		tracing::info!(%id, port = config.port, "advertising on the LAN");
 		Ok(Self {
+			instance,
 			id,
 			token,
 			secret: config.secret,
+			peers: HashMap::new(),
 			daemon,
 			events,
 		})
@@ -270,7 +305,7 @@ impl Discovery {
 					let Some(id) = instance_id(&info.fullname) else {
 						continue;
 					};
-					if id == self.id {
+					if id == self.instance {
 						continue;
 					}
 					// A record without a fingerprint can't be dialed securely; skip it.
@@ -279,6 +314,7 @@ impl Discovery {
 					};
 					let advert = Advertisement {
 						fingerprint,
+						node: info.txt_properties.get_property_val_str(TXT_NODE),
 						token: info.txt_properties.get_property_val_str(TXT_TOKEN),
 						nonce: info.txt_properties.get_property_val_str(TXT_NONCE),
 						proof: info.txt_properties.get_property_val_str(TXT_ADVERT),
@@ -295,8 +331,14 @@ impl Discovery {
 						.collect();
 					// Deterministic order, preferring IPv4 when both families are advertised.
 					addrs.sort_by_key(|addr| (addr.is_ipv6(), *addr));
+					let peer_id = advert
+						.node
+						.and_then(|node| Url::parse(node).ok())
+						.map(|node| node.to_string())
+						.unwrap_or_else(|| id.to_string());
+					self.peers.insert(id.to_string(), peer_id.clone());
 					return Some(Event::Found(Peer {
-						id: id.to_string(),
+						id: peer_id,
 						addrs,
 						fingerprint: fingerprint.to_string(),
 						token,
@@ -304,10 +346,16 @@ impl Discovery {
 				}
 				ServiceEvent::ServiceRemoved(_ty, fullname) => {
 					let Some(id) = instance_id(&fullname) else { continue };
-					if id == self.id {
+					if id == self.instance {
 						continue;
 					}
-					return Some(Event::Lost(id.to_string()));
+					let Some(peer_id) = self.peers.remove(id) else {
+						continue;
+					};
+					if self.peers.values().any(|other| other == &peer_id) {
+						continue;
+					}
+					return Some(Event::Lost(peer_id));
 				}
 				_ => continue,
 			}
@@ -355,23 +403,26 @@ fn scoped_addr(addr: IpAddr, port: u16, scope_id: u32) -> SocketAddr {
 	}
 }
 
-/// An HMAC-SHA256 proof of knowing `secret`, bound to a listener's `nonce` and
-/// certificate `fingerprint` (so it replays nowhere else) and to a `context`
-/// (so the advert and dial roles can't stand in for each other).
-fn proof(secret: &Secret, context: &str, nonce: &str, fingerprint: &str) -> String {
-	let mut mac =
-		hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_str().as_bytes()).expect("HMAC accepts any key length");
+/// An HMAC-SHA256 proof of knowing `secret`, bound to a listener's `nonce`,
+/// certificate `fingerprint`, and optional cluster `node` identity (so it
+/// replays nowhere else), plus a `context` separating the advert and dial roles.
+fn proof(secret: &Secret, context: &str, nonce: &str, fingerprint: &str, node: Option<&str>) -> String {
+	let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
 	mac.update(context.as_bytes());
 	mac.update(&[0]);
 	mac.update(nonce.as_bytes());
 	mac.update(&[0]);
 	mac.update(fingerprint.as_bytes());
+	mac.update(&[0]);
+	mac.update(node.unwrap_or_default().as_bytes());
 	hex::encode(mac.finalize().into_bytes())
 }
 
 /// The membership fields carried by one peer's advertisement.
+#[derive(Clone, Copy)]
 struct Advertisement<'a> {
 	fingerprint: &'a str,
+	node: Option<&'a str>,
 	token: Option<&'a str>,
 	nonce: Option<&'a str>,
 	proof: Option<&'a str>,
@@ -383,8 +434,11 @@ fn dial_token(secret: Option<&Secret>, advert: Advertisement<'_>) -> Option<Stri
 		None => advert.token.map(str::to_string),
 		Some(secret) => {
 			let (nonce, presented) = (advert.nonce?, advert.proof?);
-			ct_eq(presented, &proof(secret, CONTEXT_ADVERT, nonce, advert.fingerprint))
-				.then(|| proof(secret, CONTEXT_DIAL, nonce, advert.fingerprint))
+			ct_eq(
+				presented,
+				&proof(secret, CONTEXT_ADVERT, nonce, advert.fingerprint, advert.node),
+			)
+			.then(|| proof(secret, CONTEXT_DIAL, nonce, advert.fingerprint, advert.node))
 		}
 	}
 }
@@ -400,11 +454,11 @@ fn instance_id(fullname: &str) -> Option<&str> {
 	fullname.strip_suffix(SERVICE_TYPE)?.strip_suffix('.')
 }
 
-/// Connects every discovered local peer to one shared origin.
+/// Connects every discovered LAN peer to one shared origin.
 ///
 /// Runs its own QUIC listener (a random port with a generated, fingerprint-
 /// pinned certificate), advertises it with mDNS, and opens a single
-/// bidirectional MoQ session per peer. The lower instance id dials. Every
+/// bidirectional MoQ session per peer. The lower advertised identity dials. Every
 /// session, dialed or accepted, both publishes the origin and ingests the
 /// peer's broadcasts into it, so the whole network converges on one set of
 /// broadcasts with no relay involved.
@@ -412,6 +466,7 @@ pub struct Mesh {
 	origin: moq_net::origin::Producer,
 	versions: moq_net::Versions,
 	secret: Option<Secret>,
+	node: Option<String>,
 }
 
 impl Mesh {
@@ -421,6 +476,7 @@ impl Mesh {
 			origin,
 			versions: moq_net::Versions::all(),
 			secret: None,
+			node: None,
 		}
 	}
 
@@ -440,6 +496,15 @@ impl Mesh {
 		self
 	}
 
+	/// Advertise a canonical cluster node URL as the stable LAN identity.
+	///
+	/// Peers still dial the LAN socket from mDNS. The URL is used only for
+	/// identity, deduplication, and the symmetric mesh dial tiebreaker.
+	pub fn with_node(mut self, node: impl Into<String>) -> Self {
+		self.node = Some(node.into());
+		self
+	}
+
 	/// Bind the listener and start advertising, failing fast on a QUIC bind or
 	/// mDNS error. Signal readiness (e.g. systemd `READY=1`) after this returns,
 	/// then drive [`Running::run`].
@@ -448,6 +513,10 @@ impl Mesh {
 	}
 
 	fn start_inner(self) -> InternalResult<Running> {
+		let node = self
+			.node
+			.map(|node| Url::parse(&node).map(|node| node.to_string()))
+			.transpose()?;
 		let versions = authenticated_versions(&self.versions)?;
 		let server = listener(&versions)?;
 		let port = server.local_addr()?.port();
@@ -460,6 +529,7 @@ impl Mesh {
 
 		let mut config = Config::new(port, fingerprint);
 		config.secret = self.secret;
+		config.node = node;
 		let discovery = Discovery::new(config)?;
 		Ok(Running {
 			origin: self.origin,
@@ -509,10 +579,10 @@ impl Running {
 							// a rotated cert). The old dial would retry stale state forever,
 							// so restart it against the fresh advertisement.
 							Some(dial) => {
-								tracing::info!(peer = %peer.id, "local peer re-advertised; redialing");
+								tracing::info!(peer = %peer.id, "LAN peer re-advertised; redialing");
 								dial.handle.abort();
 							}
-							None => tracing::info!(peer = %peer.id, "discovered local peer; dialing"),
+							None => tracing::info!(peer = %peer.id, "discovered LAN peer; dialing"),
 						}
 						let dialer = Dialer::new(self.origin.clone(), self.versions.clone());
 						let handle = tasks.spawn(dialer.run(peer.clone()));
@@ -520,7 +590,7 @@ impl Running {
 					}
 					Some(Event::Lost(id)) => {
 						if let Some(dial) = dials.remove(&id) {
-							tracing::info!(peer = %id, "local peer expired; dropping dial");
+							tracing::info!(peer = %id, "LAN peer expired; dropping dial");
 							dial.handle.abort();
 						}
 					}
@@ -532,7 +602,7 @@ impl Running {
 					let expected = expected.clone();
 					tasks.spawn(async move {
 						if let Err(err) = accept_session(request, origin, &expected).await {
-							tracing::warn!(%err, "local peer session ended");
+							tracing::warn!(%err, "LAN peer session ended");
 						}
 					});
 				}
@@ -578,7 +648,7 @@ fn listener(versions: &moq_net::Versions) -> InternalResult<crate::Server> {
 	match listener_bind("[::]:0", versions) {
 		Ok(server) => Ok(server),
 		Err(err) => {
-			tracing::debug!(%err, "failed to bind the local mesh over IPv6; falling back to IPv4");
+			tracing::debug!(%err, "failed to bind the LAN mesh over IPv6; falling back to IPv4");
 			listener_bind("0.0.0.0:0", versions)
 		}
 	}
@@ -590,7 +660,7 @@ fn listener_bind(bind: &str, versions: &moq_net::Versions) -> InternalResult<cra
 		version: versions.iter().copied().collect(),
 		..Default::default()
 	};
-	config.tls.generate = vec!["moq-local".to_string()];
+	config.tls.generate = vec!["moq-cluster-lan".to_string()];
 	Ok(config.init()?)
 }
 
@@ -613,7 +683,7 @@ async fn accept_session(
 		.with_subscriber(origin.clone())
 		.ok()
 		.await?;
-	tracing::info!("accepted local peer");
+	tracing::info!("accepted LAN peer");
 	Err(session.closed().await.into())
 }
 
@@ -635,7 +705,7 @@ impl Dialer {
 		loop {
 			let started = tokio::time::Instant::now();
 			if let Err(err) = self.connect(&peer).await {
-				tracing::warn!(%err, peer = %peer.id, "local peer session ended; will retry");
+				tracing::warn!(%err, peer = %peer.id, "LAN peer session ended; will retry");
 			}
 			backoff = match started.elapsed() >= DIAL_STABLE {
 				true => DIAL_BACKOFF_BASE,
@@ -696,6 +766,9 @@ impl Dialer {
 mod tests {
 	use super::*;
 
+	const KEY_A: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+	const KEY_B: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+
 	/// Exactly one side of every pair dials: the lower id. Symmetric ids never
 	/// dial themselves.
 	#[test]
@@ -705,34 +778,41 @@ mod tests {
 		assert!(!should_dial("aaaa", "aaaa"));
 	}
 
-	/// Each proof is bound to the secret, the role, and the listener's
-	/// nonce + fingerprint, so a proof captured in one place stands in nowhere
-	/// else: a different listener, the advert role, or a different secret all
-	/// produce different values.
+	/// Each proof is bound to the secret, role, listener, and node identity, so
+	/// a proof captured in one place stands in nowhere else.
 	#[test]
 	fn secret_proofs_are_bound() {
-		let swordfish = Secret::new("swordfish").expect("valid secret");
-		let hunter2 = Secret::new("hunter2").expect("valid secret");
-		let dial = proof(&swordfish, CONTEXT_DIAL, "nonce", "fp1");
-		assert_eq!(dial, proof(&swordfish, CONTEXT_DIAL, "nonce", "fp1"));
-		assert_ne!(dial, proof(&swordfish, CONTEXT_DIAL, "nonce", "fp2"));
-		assert_ne!(dial, proof(&swordfish, CONTEXT_DIAL, "other", "fp1"));
-		assert_ne!(dial, proof(&swordfish, CONTEXT_ADVERT, "nonce", "fp1"));
-		assert_ne!(dial, proof(&hunter2, CONTEXT_DIAL, "nonce", "fp1"));
+		let key_a = Secret::new(KEY_A).expect("valid secret");
+		let key_b = Secret::new(KEY_B).expect("valid secret");
+		let dial = proof(&key_a, CONTEXT_DIAL, "nonce", "fp1", Some("moqt://node-a"));
+		assert_eq!(dial, proof(&key_a, CONTEXT_DIAL, "nonce", "fp1", Some("moqt://node-a")));
+		assert_ne!(dial, proof(&key_a, CONTEXT_DIAL, "nonce", "fp2", Some("moqt://node-a")));
+		assert_ne!(dial, proof(&key_a, CONTEXT_DIAL, "other", "fp1", Some("moqt://node-a")));
+		assert_ne!(
+			dial,
+			proof(&key_a, CONTEXT_ADVERT, "nonce", "fp1", Some("moqt://node-a"))
+		);
+		assert_ne!(dial, proof(&key_b, CONTEXT_DIAL, "nonce", "fp1", Some("moqt://node-a")));
+		assert_ne!(dial, proof(&key_a, CONTEXT_DIAL, "nonce", "fp1", Some("moqt://node-b")));
+		assert_ne!(dial, proof(&key_a, CONTEXT_DIAL, "nonce", "fp1", None));
 
 		assert!(ct_eq(&dial, &dial.clone()));
 		assert!(!ct_eq(&dial, "short"));
-		assert!(!ct_eq(&dial, &proof(&hunter2, CONTEXT_DIAL, "nonce", "fp1")));
+		assert!(!ct_eq(
+			&dial,
+			&proof(&key_b, CONTEXT_DIAL, "nonce", "fp1", Some("moqt://node-a"))
+		));
 	}
 
 	#[test]
 	fn dial_token_filters_membership_modes_and_proofs() {
-		let secret = Secret::new("swordfish").expect("valid secret");
-		let other = Secret::new("hunter2").expect("valid secret");
-		let advert = proof(&secret, CONTEXT_ADVERT, "nonce", "fingerprint");
-		let expected = proof(&secret, CONTEXT_DIAL, "nonce", "fingerprint");
+		let secret = Secret::new(KEY_A).expect("valid secret");
+		let other = Secret::new(KEY_B).expect("valid secret");
+		let advert = proof(&secret, CONTEXT_ADVERT, "nonce", "fingerprint", None);
+		let expected = proof(&secret, CONTEXT_DIAL, "nonce", "fingerprint", None);
 		let membership = |token, nonce, proof| Advertisement {
 			fingerprint: "fingerprint",
+			node: None,
 			token,
 			nonce,
 			proof,
@@ -751,7 +831,7 @@ mod tests {
 		assert_eq!(dial_token(Some(&secret), membership(None, None, Some(&advert))), None);
 		assert_eq!(dial_token(Some(&secret), membership(None, Some("nonce"), None)), None);
 
-		let wrong = proof(&other, CONTEXT_ADVERT, "nonce", "fingerprint");
+		let wrong = proof(&other, CONTEXT_ADVERT, "nonce", "fingerprint", None);
 		assert_eq!(
 			dial_token(Some(&secret), membership(None, Some("nonce"), Some(&wrong))),
 			None
@@ -759,9 +839,11 @@ mod tests {
 	}
 
 	#[test]
-	fn secret_rejects_empty_values() {
-		assert!(matches!(Secret::new(""), Err(Error(ErrorKind::EmptySecret))));
-		assert_eq!(format!("{:?}", Secret::new("swordfish").unwrap()), "Secret([redacted])");
+	fn secret_requires_exactly_32_hex_bytes_and_redacts_debug() {
+		for invalid in ["", "00", &"x".repeat(64), &"00".repeat(33)] {
+			assert!(matches!(Secret::new(invalid), Err(Error(ErrorKind::InvalidSecret))));
+		}
+		assert_eq!(format!("{:?}", Secret::new(KEY_A).unwrap()), "Secret([redacted])");
 	}
 
 	#[test]
@@ -963,7 +1045,7 @@ mod tests {
 	/// The full path: two meshes find each other over real mDNS and converge
 	/// on each other's broadcasts. Ignored because it multicasts on the host
 	/// network, which CI runners may block; run it by hand when touching
-	/// discovery: `just rs test -p moq-native --features local --run-ignored ignored-only`.
+	/// discovery: `just rs test -p moq-native --features cluster-lan --run-ignored ignored-only`.
 	#[tokio::test]
 	#[ignore = "needs multicast on the host network; run manually"]
 	async fn mesh_discovers_and_connects() {
@@ -976,8 +1058,8 @@ mod tests {
 			.create_broadcast("from-a", moq_net::broadcast::Route::new().with_announce(true))
 			.expect("failed to create broadcast");
 
-		tokio::spawn(Mesh::new(origin_a.clone()).run());
-		tokio::spawn(Mesh::new(origin_b.clone()).run());
+		tokio::spawn(Mesh::new(origin_a.clone()).with_node("moqt://node-a.example").run());
+		tokio::spawn(Mesh::new(origin_b.clone()).with_node("moqt://node-b.example").run());
 
 		let mut announced_on_b = origin_b.consume().announced();
 		let update = tokio::time::timeout(TIMEOUT, announced_on_b.next())
@@ -1003,9 +1085,19 @@ mod tests {
 			.create_broadcast("from-a", moq_net::broadcast::Route::new().with_announce(true))
 			.expect("failed to create broadcast");
 
-		let secret = Secret::new("swordfish").expect("valid secret");
-		tokio::spawn(Mesh::new(origin_a.clone()).with_secret(secret.clone()).run());
-		tokio::spawn(Mesh::new(origin_b.clone()).with_secret(secret).run());
+		let secret = Secret::new(KEY_A).expect("valid secret");
+		tokio::spawn(
+			Mesh::new(origin_a.clone())
+				.with_node("moqt://node-a.example")
+				.with_secret(secret.clone())
+				.run(),
+		);
+		tokio::spawn(
+			Mesh::new(origin_b.clone())
+				.with_node("moqt://node-b.example")
+				.with_secret(secret)
+				.run(),
+		);
 
 		let mut announced_on_b = origin_b.consume().announced();
 		let update = tokio::time::timeout(TIMEOUT, announced_on_b.next())

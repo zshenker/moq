@@ -52,7 +52,7 @@ fn parse_rung(arg: &str) -> Result<moq_transcode::Rung, String> {
 /// Run the transcoder: subscribe to the source through the relay, publish the
 /// derivative back through the same session, and serve rungs until either ends.
 pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
-	moq.reject_discover("transcode")?;
+	moq.reject_lan("transcode")?;
 	let source_path = moq
 		.broadcast
 		.clone()

@@ -84,9 +84,8 @@ moq <MoQ side>  <import|export>  <endpoint> [endpoint options]
     broadcast.
   - `--server-bind <addr>` hosts MoQ sessions directly (with `--tls-generate` /
     `--tls-cert` + `--tls-key`).
-  - `--client-discover` meshes with every other discovering process on the
-    local network via mDNS, no relay or internet needed. See
-    [Local Network](#local-network-mdns).
+  - `--cluster-lan` meshes with every other participating process on the LAN
+    via mDNS, no relay or internet needed. See [LAN Cluster](#lan-cluster-mdns).
 
   Any combination may be given at once (e.g. dial a relay *and* accept incoming
   sessions).
@@ -122,31 +121,30 @@ ffmpeg -i video.mp4 -c copy -f mpegts - | \
     moq --client-connect https://relay.example.com/anon --broadcast my-stream.hang import ts
 ```
 
-### Local Network (mDNS)
+### LAN Cluster (mDNS)
 
-`--client-discover` advertises the process over mDNS (DNS-SD,
-`_moq._udp.local`) and automatically connects to every other MoQ process on
-the local network, no relay, internet, or certificate setup needed. Each
-process runs a QUIC listener with a generated certificate and advertises its
-port plus the cert's SHA-256 fingerprint; dialers pin the fingerprint, so
-sessions are encrypted without a CA. Each pair of peers opens one
-bidirectional session (a per-run id breaks the tie on who dials) and
-everything shares one set of broadcasts, like a miniature relay cluster:
+`--cluster-lan` advertises the process over mDNS (DNS-SD,
+`_moq._udp.local`) and connects to every other participating MoQ process on
+the LAN, no relay, internet, or certificate setup needed. Each process runs a
+QUIC listener with a generated certificate and advertises its port plus the
+certificate's SHA-256 fingerprint. Dialers pin that fingerprint, so sessions
+are encrypted without a CA. Each pair opens one bidirectional session and
+shares one set of broadcasts, like a miniature relay cluster:
 
 ```bash
 # On one machine: publish a stream to the LAN.
 ffmpeg -i video.mp4 -c copy -f mpegts - | \
-    moq --client-discover --broadcast lan-demo.hang import ts
+    moq --cluster-lan --broadcast lan-demo.hang import ts
 
 # On another: discover it and play it.
-moq --client-discover --broadcast lan-demo.hang export ts | mpv -
+moq --cluster-lan --broadcast lan-demo.hang export ts | mpv -
 ```
 
-It composes with the other MoQ sides. The common pairing is a local mesh plus
-a CDN for everyone else: `--client-discover --client-connect
+It composes with the other MoQ sides. The common pairing is a LAN mesh plus a
+CDN for everyone else: `--cluster-lan --client-connect
 https://relay.example.com/anon` serves viewers on the same network directly
 while the relay serves external ones, all from one process and one set of
-broadcasts. With `--client-discover` alone nothing leaves the local network;
+broadcasts. With `--cluster-lan` alone nothing leaves the local network;
 adding a bridge shares the same broadcasts with whatever it connects to, in
 both directions.
 
@@ -154,12 +152,26 @@ Joining the mesh requires a token carried in the mDNS advertisement, so merely
 reaching the QUIC port (say, on a machine with a public address) grants
 nothing. By default anyone on the local network can read the advertisement and
 join, so use it on networks you trust. On a network you don't fully trust,
-pass `--client-discover-secret <secret>` (the same value on every peer):
-joining then requires knowing the secret, peers without it are invisible, and
-the secret itself never travels the network (peers exchange HMAC proofs bound
-to each listener, so nothing observed or received can be replayed elsewhere).
-Pick a strong secret; a weak one can be brute-forced offline from the
-advertisement. Empty secrets are rejected.
+add `--cluster-lan-secret <key-or-path>` to every peer. The value is either a
+32-byte key encoded as exactly 64 hexadecimal characters, or a path whose
+trimmed contents have that format. A missing file is an error and is never
+generated automatically. For example:
+
+```bash
+openssl rand -hex 32 > cluster.key
+moq --cluster-lan --cluster-lan-secret cluster.key --broadcast lan-demo.hang export ts
+```
+
+Joining then requires knowing the key, peers without it are invisible, and the
+key itself never travels the network. Peers exchange HMAC proofs bound to each
+listener and its advertised identity, so an observed proof cannot be replayed
+elsewhere.
+
+`--cluster-node <url>` gives this process the same canonical identity used by
+the other cluster mechanisms. When present, the URL is included in mDNS and
+used for deduplication and deciding which side dials. Peers still dial the LAN
+address and port from mDNS, not the cluster-node URL. Without it, the process
+uses a random identity for that run.
 
 ### Redundant Publishers (1+1)
 

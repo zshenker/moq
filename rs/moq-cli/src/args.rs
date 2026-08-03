@@ -2,9 +2,9 @@
 //!
 //! Grammar: `moq <MoQ side> <import|export> <endpoint> [endpoint opts]`.
 //!
-//! - The MoQ side (`--client-connect`, `--server-bind`, or `--client-discover`)
+//! - The MoQ side (`--client-connect`, `--server-bind`, or `--cluster-lan`)
 //!   attaches the shared Origin to the MoQ network and comes before the verb.
-//!   They compose, so a process can dial, accept, and join the local mesh.
+//!   They compose, so a process can dial, accept, and join the LAN mesh.
 //! - `import` routes media INTO MoQ from one source; `export` routes it OUT to
 //!   one sink. The verb fixes the data direction (and thus, for the
 //!   bidirectional gateways, whether `--connect`/`--listen` push or pull).
@@ -42,13 +42,13 @@ pub struct Cli {
 	pub command: Command,
 }
 
-/// The MoQ attachment: a relay dial, server listener, local mesh, or combination.
+/// The MoQ attachment: a relay dial, server listener, LAN mesh, or combination.
 ///
 /// The group is not `required`, because the local verbs (`token`, `devices`) run
 /// without a MoQ side. Every verb that does need one calls
 /// [`validate`](Self::validate).
 #[derive(Args, Clone)]
-#[command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind"]))]
+#[command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind", "cluster-lan"]))]
 pub struct MoqSide {
 	/// The broadcast name. Optional for the point endpoints (stdin/stdout, HLS
 	/// import, and the `--connect` dials), which default to the root broadcast at
@@ -81,36 +81,48 @@ pub struct MoqSide {
 	#[command(flatten)]
 	pub iroh: moq_native::iroh::EndpointConfig,
 
-	/// Discover and mesh with every other MoQ process on the local network via
+	/// The canonical URL naming this cluster node.
+	///
+	/// LAN advertisements include this identity when configured. The LAN socket
+	/// remains the address peers dial.
+	#[arg(
+		long = "cluster-node",
+		env = "MOQ_CLUSTER_NODE",
+		help_heading = "Cluster",
+		value_name = "URL"
+	)]
+	pub cluster_node: Option<url::Url>,
+
+	/// Discover and mesh with every other MoQ process on the LAN via
 	/// mDNS: no relay, internet, or certificate setup needed. Anyone on the
-	/// network can join (see --client-discover-secret), so use it on networks
+	/// network can join (see --cluster-lan-secret), so use it on networks
 	/// you trust. Composes with --client-connect, e.g. mesh locally while a
 	/// relay serves external viewers.
-	#[cfg(feature = "local")]
+	#[cfg(feature = "cluster-lan")]
 	#[arg(
-		id = "client-discover",
-		long = "client-discover",
-		env = "MOQ_CLIENT_DISCOVER",
-		help_heading = "MoQ",
+		id = "cluster-lan",
+		long = "cluster-lan",
+		env = "MOQ_CLUSTER_LAN",
+		help_heading = "Cluster",
 		default_missing_value = "true",
 		num_args = 0..=1,
 		require_equals = true,
 	)]
-	pub discover: Option<bool>,
+	pub cluster_lan: Option<bool>,
 
-	/// Require this shared secret to join the local mesh, instead of trusting
-	/// everyone on the network. All peers must pass the same value; anyone
-	/// without it is invisible and rejected. Implies --client-discover. Pick a
-	/// strong secret: the advertisement can be brute-forced offline against
-	/// weak ones.
-	#[cfg(feature = "local")]
+	/// A shared 32-byte cluster key, as 64 hex characters or a path containing
+	/// them. All LAN peers must pass the same value. Missing files are rejected,
+	/// never generated. Requires --cluster-lan.
+	#[cfg(feature = "cluster-lan")]
 	#[arg(
-		id = "client-discover-secret",
-		long = "client-discover-secret",
-		env = "MOQ_CLIENT_DISCOVER_SECRET",
-		help_heading = "MoQ"
+		id = "cluster-lan-secret",
+		long = "cluster-lan-secret",
+		env = "MOQ_CLUSTER_LAN_SECRET",
+		help_heading = "Cluster",
+		requires = "cluster-lan",
+		value_name = "HEX_OR_PATH"
 	)]
-	pub discover_secret: Option<moq_native::local::Secret>,
+	pub cluster_lan_secret: Option<String>,
 }
 
 impl MoqSide {
@@ -125,29 +137,58 @@ impl MoqSide {
 		.produce())
 	}
 
-	/// Whether the local mesh runs: `--client-discover` was given, or implied
-	/// by `--client-discover-secret`. The mesh is a MoQ side of its own,
-	/// needing neither a relay dial nor a server bind.
-	pub fn discover(&self) -> bool {
-		#[cfg(feature = "local")]
-		return self.discover.unwrap_or(false) || self.discover_secret.is_some();
-		#[cfg(not(feature = "local"))]
+	/// Whether `--cluster-lan` enables the LAN mesh.
+	pub fn lan(&self) -> bool {
+		#[cfg(feature = "cluster-lan")]
+		return self.cluster_lan.unwrap_or(false);
+		#[cfg(not(feature = "cluster-lan"))]
 		false
 	}
 
-	/// The local mesh (`--client-discover`), bound and advertising so a bind or
+	/// The LAN mesh (`--cluster-lan`), bound and advertising so a bind or
 	/// mDNS failure surfaces before readiness is signaled, or `None` when
 	/// discovery is off.
-	#[cfg(feature = "local")]
-	pub fn mesh(&self, origin: &moq_net::origin::Producer) -> anyhow::Result<Option<moq_native::local::Running>> {
-		if !self.discover() {
+	#[cfg(feature = "cluster-lan")]
+	pub fn lan_mesh(&self, origin: &moq_net::origin::Producer) -> anyhow::Result<Option<moq_native::lan::Running>> {
+		anyhow::ensure!(
+			self.cluster_lan_secret.is_none() || self.lan(),
+			"--cluster-lan-secret requires --cluster-lan=true"
+		);
+		if !self.lan() {
 			return Ok(None);
 		}
-		let mut mesh = moq_native::local::Mesh::new(origin.clone());
-		if let Some(secret) = &self.discover_secret {
-			mesh = mesh.with_secret(secret.clone());
+
+		let mut mesh = moq_native::lan::Mesh::new(origin.clone());
+		if let Some(node) = &self.cluster_node {
+			mesh = mesh.with_node(node.as_str());
+		}
+		if let Some(secret) = self.lan_secret()? {
+			mesh = mesh.with_secret(secret);
 		}
 		Ok(Some(mesh.start()?))
+	}
+
+	#[cfg(feature = "cluster-lan")]
+	fn lan_secret(&self) -> anyhow::Result<Option<moq_native::lan::Secret>> {
+		use anyhow::Context;
+
+		let Some(value) = &self.cluster_lan_secret else {
+			return Ok(None);
+		};
+		let secret = match value.parse() {
+			Ok(secret) => secret,
+			Err(key_err) => {
+				let contents = std::fs::read_to_string(value).with_context(|| {
+					format!(
+						"invalid --cluster-lan-secret: expected a 64-character hex key or readable file ({key_err})"
+					)
+				})?;
+				contents.trim().parse().with_context(|| {
+					format!("invalid cluster LAN key in {value}: expected 64 hexadecimal characters")
+				})?
+			}
+		};
+		Ok(Some(secret))
 	}
 
 	/// Reject a verb that needs the MoQ network but was given no way to reach it.
@@ -155,8 +196,8 @@ impl MoqSide {
 	/// `devices` is exempt.
 	pub fn validate(&self) -> anyhow::Result<()> {
 		anyhow::ensure!(
-			self.client.connect.is_some() || self.server.bind.is_some() || self.discover(),
-			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --client-discover to mesh with the local network"
+			self.client.connect.is_some() || self.server.bind.is_some() || self.lan(),
+			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --cluster-lan to mesh over the LAN"
 		);
 		Ok(())
 	}
@@ -172,7 +213,8 @@ impl MoqSide {
 		let ignored = [
 			("--client-connect", self.client.connect.is_some()),
 			("--server-bind", self.server.bind.is_some()),
-			("--client-discover", self.discover()),
+			("--cluster-node", self.cluster_node.is_some()),
+			("--cluster-lan", self.lan()),
 			("--broadcast", self.broadcast.is_some()),
 		];
 
@@ -183,14 +225,14 @@ impl MoqSide {
 		Ok(())
 	}
 
-	/// Reject `--client-discover` on a verb that doesn't run the local mesh,
+	/// Reject `--cluster-lan` on a verb that doesn't run the LAN mesh,
 	/// rather than silently ignoring it. `transcode` routes through a relay
 	/// dial only.
 	#[cfg(feature = "transcode")]
-	pub fn reject_discover(&self, command: &str) -> anyhow::Result<()> {
+	pub fn reject_lan(&self, command: &str) -> anyhow::Result<()> {
 		anyhow::ensure!(
-			!self.discover(),
-			"`{command}` does not join the local mesh; drop --client-discover and pass --client-connect <url>"
+			!self.lan(),
+			"`{command}` does not join the LAN mesh; drop --cluster-lan and pass --client-connect <url>"
 		);
 		Ok(())
 	}
@@ -382,25 +424,78 @@ mod tests {
 			assert!(err.contains(flag[0]), "{err}");
 		}
 
-		#[cfg(feature = "local")]
+		#[cfg(feature = "cluster-lan")]
 		{
-			let cli = Cli::try_parse_from(["moq", "--client-discover", "token", "generate"]).unwrap();
+			let cli = Cli::try_parse_from(["moq", "--cluster-lan", "token", "generate"]).unwrap();
 			let err = cli.moq.reject("token").unwrap_err().to_string();
-			assert!(err.contains("--client-discover"), "{err}");
+			assert!(err.contains("--cluster-lan"), "{err}");
 		}
 	}
 
-	#[cfg(feature = "local")]
+	#[cfg(feature = "cluster-lan")]
 	#[test]
-	fn discovery_secret_is_non_empty_and_implies_discovery() {
-		let cli = Cli::try_parse_from(["moq", "--client-discover-secret", "swordfish", "import", "ts"]).unwrap();
-		assert!(cli.moq.discover());
-		assert!(cli.moq.validate().is_ok());
+	fn cluster_lan_secret_requires_explicit_lan_and_loads_hex_or_file() {
+		const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+		let expected: moq_native::lan::Secret = KEY.parse().expect("valid secret");
 
-		let err = Cli::try_parse_from(["moq", "--client-discover-secret", "", "import", "ts"])
+		let err = Cli::try_parse_from(["moq", "--cluster-lan-secret", KEY, "import", "ts"])
 			.err()
-			.expect("an empty secret must be rejected")
+			.expect("the secret must require explicit LAN activation")
 			.to_string();
-		assert!(err.contains("must not be empty"), "{err}");
+		assert!(err.contains("--cluster-lan"), "{err}");
+
+		let cli = Cli::try_parse_from(["moq", "--cluster-lan", "--cluster-lan-secret", KEY, "import", "ts"])
+			.expect("direct key should parse");
+		assert!(cli.moq.lan());
+		assert!(cli.moq.validate().is_ok());
+		assert_eq!(cli.moq.lan_secret().unwrap(), Some(expected.clone()));
+
+		let cli = Cli::try_parse_from([
+			"moq",
+			"--cluster-lan=false",
+			"--cluster-lan-secret",
+			KEY,
+			"import",
+			"ts",
+		])
+		.expect("an explicit false LAN value should parse");
+		let origin = moq_net::Origin::random().produce();
+		let err = cli
+			.moq
+			.lan_mesh(&origin)
+			.err()
+			.expect("a secret with disabled LAN must fail")
+			.to_string();
+		assert!(err.contains("--cluster-lan=true"), "{err}");
+
+		let file = tempfile::NamedTempFile::new().expect("create temporary key file");
+		std::fs::write(file.path(), format!("{KEY}\n")).expect("write temporary key file");
+		let path = file.path().to_str().expect("UTF-8 temporary path");
+		let cli = Cli::try_parse_from(["moq", "--cluster-lan", "--cluster-lan-secret", path, "import", "ts"])
+			.expect("key file should parse");
+		assert_eq!(cli.moq.lan_secret().unwrap(), Some(expected));
+
+		let cli = Cli::try_parse_from([
+			"moq",
+			"--cluster-lan",
+			"--cluster-lan-secret",
+			"definitely-missing-cluster-key",
+			"import",
+			"ts",
+		])
+		.expect("missing key path should parse as an argument");
+		let err = cli.moq.lan_secret().unwrap_err().to_string();
+		assert!(err.contains("64-character hex key or readable file"), "{err}");
+
+		let cli = Cli::try_parse_from([
+			"moq",
+			"--cluster-lan",
+			"--cluster-node",
+			"moqt://relay.example.com:4443",
+			"import",
+			"ts",
+		])
+		.expect("cluster node should parse");
+		assert_eq!(cli.moq.cluster_node.unwrap().as_str(), "moqt://relay.example.com:4443");
 	}
 }

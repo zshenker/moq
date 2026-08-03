@@ -65,8 +65,8 @@ impl Net {
 struct MoqAttachments {
 	client: Option<moq_native::Reconnect>,
 	server: Option<(String, moq_native::Server)>,
-	#[cfg(feature = "local")]
-	mesh: Option<moq_native::local::Running>,
+	#[cfg(feature = "cluster-lan")]
+	lan: Option<moq_native::lan::Running>,
 }
 
 impl MoqAttachments {
@@ -92,19 +92,19 @@ impl MoqAttachments {
 		Ok(attachments)
 	}
 
-	fn new(moq: &MoqSide, origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
+	fn new(moq: &MoqSide, _origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
 		let server = match moq.server.bind.clone() {
 			Some(bind) => Some((bind, net.server(moq.server.clone())?)),
 			None => None,
 		};
-		#[cfg(feature = "local")]
-		let mesh = moq.mesh(origin)?;
+		#[cfg(feature = "cluster-lan")]
+		let lan = moq.lan_mesh(_origin)?;
 
 		Ok(Self {
 			client: None,
 			server,
-			#[cfg(feature = "local")]
-			mesh,
+			#[cfg(feature = "cluster-lan")]
+			lan,
 		})
 	}
 }
@@ -212,9 +212,9 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 		tasks.spawn(async move { Ok(server.serve_publish(origin).await?) });
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
 	}
-	#[cfg(feature = "local")]
-	if let Some(mesh) = attachments.mesh {
-		tasks.spawn(async move { Ok(mesh.run().await?) });
+	#[cfg(feature = "cluster-lan")]
+	if let Some(lan) = attachments.lan {
+		tasks.spawn(async move { Ok(lan.run().await?) });
 	}
 
 	// Foreign side: the single source.
@@ -311,9 +311,9 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 		tasks.spawn(async move { Ok(server.serve_consume(origin).await?) });
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
 	}
-	#[cfg(feature = "local")]
-	if let Some(mesh) = attachments.mesh {
-		tasks.spawn(async move { Ok(mesh.run().await?) });
+	#[cfg(feature = "cluster-lan")]
+	if let Some(lan) = attachments.lan {
+		tasks.spawn(async move { Ok(lan.run().await?) });
 	}
 
 	// Foreign side: the single sink.

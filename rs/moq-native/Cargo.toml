@@ -29,9 +29,9 @@ qlog = ["quinn?/qlog", "web-transport-noq?/qlog"]
 # are off on each backend dep), so a backend without aws-lc-rs/ring has no initial cipher.
 aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs", "web-transport-noq?/aws-lc-rs"]
 iroh = ["dep:web-transport-iroh", "dep:web-transport-proto", "dep:noq-proto"]
-# mDNS discovery and meshing with other MoQ processes on the local network
-# (the `local` module). Rides the quinn backend with a generated certificate.
-local = ["dep:mdns-sd", "dep:hmac", "dep:sha2", "dep:subtle", "quinn"]
+# mDNS discovery and meshing with other MoQ processes on the LAN
+# (the `lan` module). Rides the quinn backend with a generated certificate.
+cluster-lan = ["dep:mdns-sd", "dep:hmac", "dep:sha2", "dep:subtle", "quinn"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 websocket = ["dep:qmux"]
 # Plain-TCP qmux transport (`tcp://`), no TLS. Server-side and client-side.

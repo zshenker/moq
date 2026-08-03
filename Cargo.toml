@@ -75,13 +75,13 @@ rust-version = "1.91"
 [workspace.dependencies]
 flate2 = "1.1"
 hang = { version = "0.20", path = "rs/hang" }
-# HMAC-SHA256 for the local-discovery pre-shared-secret proofs (moq-native's `local` feature).
+# HMAC-SHA256 for the cluster-LAN pre-shared-key proofs (moq-native's `cluster-lan` feature).
 hmac = "0.13"
 kio = { version = "0.5", path = "rs/kio" }
 # Permutation testing for the kio primitives (and everything built on them).
 # Only compiled under `--cfg loom`; see `just rs loom`.
 loom = { version = "0.7.2", features = ["futures"] }
-# DNS-SD advertisement and browsing for local-network discovery (moq-native's `local` feature).
+# DNS-SD advertisement and browsing for LAN discovery (moq-native's `cluster-lan` feature).
 # `async` enables awaiting the event channel (flume) instead of blocking on it.
 mdns-sd = { version = "0.20", features = ["async"] }
 moq-audio = { version = "0.0.15", path = "rs/moq-audio" }

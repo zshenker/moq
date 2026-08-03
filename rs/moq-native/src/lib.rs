@@ -7,7 +7,7 @@
 //! - Plain TCP via the `tcp://` scheme (qmux, no TLS; requires `tcp` feature)
 //! - Unix domain socket via the `unix://` scheme (qmux, peer-credential aware; requires `uds` feature, unix-only)
 //! - Iroh P2P (requires `iroh` feature)
-//! - Local-network mDNS mesh (requires `local` feature)
+//! - LAN mDNS mesh (requires `cluster-lan` feature)
 //!
 //! See [`Client`] for connecting to relays and [`Server`] for accepting connections.
 
@@ -79,8 +79,8 @@ pub mod quiche;
 #[cfg(feature = "iroh")]
 pub mod iroh;
 
-#[cfg(feature = "local")]
-pub mod local;
+#[cfg(feature = "cluster-lan")]
+pub mod lan;
 
 /// The QUIC backend to use for connections.
 #[derive(Clone, Debug, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
