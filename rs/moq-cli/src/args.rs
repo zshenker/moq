@@ -82,17 +82,34 @@ pub struct MoqSide {
 
 	/// Discover and mesh with every other MoQ process on the local network via
 	/// mDNS: no relay, internet, or certificate setup needed. Anyone on the
-	/// network can join, so use it on networks you trust.
+	/// network can join (see --client-discover-secret), so use it on networks
+	/// you trust. Composes with --client-connect, e.g. mesh locally while a
+	/// relay serves external viewers.
 	#[cfg(feature = "local")]
 	#[arg(
-		long,
-		env = "MOQ_DISCOVER",
+		id = "client-discover",
+		long = "client-discover",
+		env = "MOQ_CLIENT_DISCOVER",
 		help_heading = "MoQ",
 		default_missing_value = "true",
 		num_args = 0..=1,
 		require_equals = true,
 	)]
 	pub discover: Option<bool>,
+
+	/// Require this shared secret to join the local mesh, instead of trusting
+	/// everyone on the network. All peers must pass the same value; anyone
+	/// without it is invisible and rejected. Implies --client-discover. Pick a
+	/// strong secret: the advertisement can be brute-forced offline against
+	/// weak ones.
+	#[cfg(feature = "local")]
+	#[arg(
+		id = "client-discover-secret",
+		long = "client-discover-secret",
+		env = "MOQ_CLIENT_DISCOVER_SECRET",
+		help_heading = "MoQ"
+	)]
+	pub discover_secret: Option<String>,
 }
 
 impl MoqSide {
@@ -107,13 +124,29 @@ impl MoqSide {
 		.produce())
 	}
 
-	/// Whether `--discover` was given: the local-network mesh is a MoQ side of
-	/// its own, needing neither a relay dial nor a server bind.
+	/// Whether the local mesh runs: `--client-discover` was given, or implied
+	/// by `--client-discover-secret`. The mesh is a MoQ side of its own,
+	/// needing neither a relay dial nor a server bind.
 	pub fn discover(&self) -> bool {
 		#[cfg(feature = "local")]
-		return self.discover.unwrap_or(false);
+		return self.discover.unwrap_or(false) || self.discover_secret.is_some();
 		#[cfg(not(feature = "local"))]
 		false
+	}
+
+	/// The local mesh (`--client-discover`), bound and advertising so a bind or
+	/// mDNS failure surfaces before readiness is signaled, or `None` when
+	/// discovery is off.
+	#[cfg(feature = "local")]
+	pub fn mesh(&self, origin: &moq_net::origin::Producer) -> anyhow::Result<Option<moq_native::local::Running>> {
+		if !self.discover() {
+			return Ok(None);
+		}
+		let mut mesh = moq_native::local::Mesh::new(origin.clone());
+		if let Some(secret) = &self.discover_secret {
+			mesh = mesh.with_secret(secret.clone());
+		}
+		Ok(Some(mesh.start()?))
 	}
 
 	/// Reject a verb that needs the MoQ network but was given no way to reach it.
@@ -122,7 +155,7 @@ impl MoqSide {
 	pub fn validate(&self) -> anyhow::Result<()> {
 		anyhow::ensure!(
 			self.client.connect.is_some() || self.server.bind.is_some() || self.discover(),
-			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --discover to mesh with the local network"
+			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --client-discover to mesh with the local network"
 		);
 		Ok(())
 	}
@@ -133,18 +166,19 @@ impl MoqSide {
 	pub fn reject(&self, command: &str) -> anyhow::Result<()> {
 		anyhow::ensure!(
 			self.client.connect.is_none() && self.server.bind.is_none() && !self.discover(),
-			"`{command}` runs locally and takes no MoQ side; drop --client-connect / --server-bind / --discover"
+			"`{command}` runs locally and takes no MoQ side; drop --client-connect / --server-bind / --client-discover"
 		);
 		Ok(())
 	}
 
-	/// Reject `--discover` on a verb that doesn't run the local mesh, rather
-	/// than silently ignoring it. `transcode` routes through a relay dial only.
+	/// Reject `--client-discover` on a verb that doesn't run the local mesh,
+	/// rather than silently ignoring it. `transcode` routes through a relay
+	/// dial only.
 	#[cfg(feature = "transcode")]
 	pub fn reject_discover(&self, command: &str) -> anyhow::Result<()> {
 		anyhow::ensure!(
 			!self.discover(),
-			"`{command}` does not join the local mesh; drop --discover and pass --client-connect <url>"
+			"`{command}` does not join the local mesh; drop --client-discover and pass --client-connect <url>"
 		);
 		Ok(())
 	}

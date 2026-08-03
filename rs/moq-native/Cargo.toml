@@ -31,7 +31,7 @@ aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs", 
 iroh = ["dep:web-transport-iroh", "dep:web-transport-proto", "dep:noq-proto"]
 # mDNS discovery and meshing with other MoQ processes on the local network
 # (the `local` module). Rides the quinn backend with a generated certificate.
-local = ["dep:mdns-sd", "quinn"]
+local = ["dep:mdns-sd", "dep:hmac", "dep:sha2", "quinn"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 websocket = ["dep:qmux"]
 # Plain-TCP qmux transport (`tcp://`), no TLS. Server-side and client-side.
@@ -46,6 +46,7 @@ android-logcat = ["dep:tracing-android"]
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 hex = "0.4"
+hmac = { workspace = true, optional = true }
 humantime = "2.3"
 humantime-serde = "1.1"
 mdns-sd = { workspace = true, optional = true }
@@ -69,6 +70,7 @@ rustls-platform-verifier = "0.7"
 rustls-webpki = { version = "0.103", features = ["aws-lc-rs"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_with = { version = "3", features = ["hex"] }
+sha2 = { workspace = true, optional = true }
 socket2 = "0.6"
 thiserror = "2"
 tikv-jemalloc-ctl = { version = "0.6", optional = true }

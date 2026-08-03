@@ -157,10 +157,7 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
 	}
 	#[cfg(feature = "local")]
-	if moq.discover() {
-		// Bind and advertise before signaling readiness, so a bind or mDNS
-		// failure surfaces instead of releasing dependent units.
-		let mesh = moq_native::local::Mesh::new(origin.clone()).start()?;
+	if let Some(mesh) = moq.mesh(&origin)? {
 		moq::notify_ready();
 		tasks.spawn(async move { Ok(mesh.run().await?) });
 	}
@@ -261,10 +258,7 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
 	}
 	#[cfg(feature = "local")]
-	if moq.discover() {
-		// Bind and advertise before signaling readiness, so a bind or mDNS
-		// failure surfaces instead of releasing dependent units.
-		let mesh = moq_native::local::Mesh::new(origin.clone()).start()?;
+	if let Some(mesh) = moq.mesh(&origin)? {
 		moq::notify_ready();
 		tasks.spawn(async move { Ok(mesh.run().await?) });
 	}

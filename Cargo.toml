@@ -75,6 +75,8 @@ rust-version = "1.91"
 [workspace.dependencies]
 flate2 = "1.1"
 hang = { version = "0.20", path = "rs/hang" }
+# HMAC-SHA256 for the local-discovery pre-shared-secret proofs (moq-native's `local` feature).
+hmac = "0.13"
 kio = { version = "0.5", path = "rs/kio" }
 # Permutation testing for the kio primitives (and everything built on them).
 # Only compiled under `--cfg loom`; see `just rs loom`.
@@ -111,6 +113,7 @@ moq-vaapi = "0.0.3"
 moq-video = { version = "0.0.11", path = "rs/moq-video", default-features = false }
 qmux = { version = "0.4.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
 tokio = "1.48"
 web-async = { version = "0.1.5", features = ["tracing"] }
 web-transport-iroh = "0.6"

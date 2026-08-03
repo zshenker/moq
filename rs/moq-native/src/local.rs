@@ -17,11 +17,19 @@
 //! advertisement carries a random per-run token that dialers must present, so
 //! only processes that can read the network's mDNS can join. A reachable QUIC
 //! port alone (e.g. a host with a public address) grants nothing.
+//!
+//! On networks you don't fully trust, set a pre-shared secret
+//! ([`Config::with_secret`]): membership then requires knowing the secret, not
+//! just reading mDNS. Both sides prove knowledge with HMAC-SHA256 proofs bound
+//! to each listener's nonce and certificate fingerprint, so the secret never
+//! travels the network and a proof presented to one peer replays nowhere else.
+//! Peers with a different secret (or none) are mutually invisible.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use hmac::{KeyInit, Mac};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use url::Url;
 
@@ -36,8 +44,19 @@ const SERVICE_TYPE: &str = "_moq._udp.local.";
 /// The TXT key carrying the listener certificate's hex SHA-256 fingerprint.
 const TXT_FINGERPRINT: &str = "fp";
 
-/// The TXT key carrying the join token dialers must present.
+/// The TXT key carrying the join token dialers must present (no secret set).
 const TXT_TOKEN: &str = "tk";
+
+/// The TXT key carrying the random nonce the secret proofs are bound to.
+const TXT_NONCE: &str = "n";
+
+/// The TXT key carrying the listener's proof that it knows the secret.
+const TXT_ADVERT: &str = "a";
+
+/// Domain separators for the two secret proofs, so a captured proof of one
+/// role can never stand in for the other.
+const CONTEXT_ADVERT: &str = "moq-local-advert";
+const CONTEXT_DIAL: &str = "moq-local-dial";
 
 /// Reconnect pacing for mesh dials, mirroring the relay's cluster dials: quick
 /// on a blip, exponential on repeated failure. A session shorter than
@@ -107,6 +126,12 @@ pub struct Config {
 	pub port: u16,
 	/// The hex SHA-256 fingerprint of the listener's certificate, which dialers pin.
 	pub fingerprint: String,
+	/// Require this pre-shared secret to join, instead of trusting everyone on
+	/// the network. Peers with a different secret (or none) are mutually
+	/// invisible. The advertisement carries an HMAC over a public nonce, so a
+	/// weak secret can be brute-forced offline by anyone on the network; pick a
+	/// strong one.
+	pub secret: Option<String>,
 }
 
 impl Config {
@@ -115,7 +140,14 @@ impl Config {
 		Self {
 			port,
 			fingerprint: fingerprint.into(),
+			secret: None,
 		}
+	}
+
+	/// Require [`secret`](Self::secret) to join the mesh.
+	pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+		self.secret = Some(secret.into());
+		self
 	}
 }
 
@@ -137,6 +169,7 @@ pub enum Event {
 pub struct Discovery {
 	id: String,
 	token: String,
+	secret: Option<String>,
 	daemon: ServiceDaemon,
 	events: mdns_sd::Receiver<ServiceEvent>,
 }
@@ -148,23 +181,33 @@ impl Discovery {
 	/// process shows up as a new peer.
 	pub fn new(config: Config) -> Result<Self> {
 		let id = format!("{:016x}", rand::random::<u64>());
-		// Only readable by whoever can see this network's mDNS, which is what
-		// makes presenting it proof of membership.
-		let token = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
-		let daemon = ServiceDaemon::new()?;
+		let random = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
 
-		let service = ServiceInfo::new(
-			SERVICE_TYPE,
-			&id,
-			&format!("{id}.local."),
-			"",
-			config.port,
-			&[
-				(TXT_FINGERPRINT, config.fingerprint.as_str()),
-				(TXT_TOKEN, token.as_str()),
-			][..],
-		)?
-		.enable_addr_auto();
+		let mut txt = std::collections::HashMap::new();
+		txt.insert(TXT_FINGERPRINT.to_string(), config.fingerprint.clone());
+		let token = match &config.secret {
+			// Only readable by whoever can see this network's mDNS, which is
+			// what makes presenting it proof of membership.
+			None => {
+				txt.insert(TXT_TOKEN.to_string(), random.clone());
+				random
+			}
+			// The proofs bind the secret to this listener's nonce and
+			// fingerprint, so the secret never travels the network and a proof
+			// given to one peer replays nowhere else.
+			Some(secret) => {
+				txt.insert(TXT_NONCE.to_string(), random.clone());
+				txt.insert(
+					TXT_ADVERT.to_string(),
+					proof(secret, CONTEXT_ADVERT, &random, &config.fingerprint),
+				);
+				proof(secret, CONTEXT_DIAL, &random, &config.fingerprint)
+			}
+		};
+
+		let daemon = ServiceDaemon::new()?;
+		let service =
+			ServiceInfo::new(SERVICE_TYPE, &id, &format!("{id}.local."), "", config.port, txt)?.enable_addr_auto();
 		daemon.register(service)?;
 		let events = daemon.browse(SERVICE_TYPE)?;
 
@@ -172,6 +215,7 @@ impl Discovery {
 		Ok(Self {
 			id,
 			token,
+			secret: config.secret,
 			daemon,
 			events,
 		})
@@ -202,13 +246,33 @@ impl Discovery {
 					if id == self.id {
 						continue;
 					}
-					// A record without a fingerprint can't be dialed securely, and one
-					// without a token can't be dialed at all; skip it.
+					// A record without a fingerprint can't be dialed securely; skip it.
 					let Some(fingerprint) = info.txt_properties.get_property_val_str(TXT_FINGERPRINT) else {
 						continue;
 					};
-					let Some(token) = info.txt_properties.get_property_val_str(TXT_TOKEN) else {
-						continue;
+					let token = match &self.secret {
+						// Bearer mode: dial with whatever the peer advertised.
+						// A peer advertising in secret mode has no token; skip it.
+						None => match info.txt_properties.get_property_val_str(TXT_TOKEN) {
+							Some(token) => token.to_string(),
+							None => continue,
+						},
+						// Secret mode: the peer must prove it knows our secret
+						// before we dial it (and hand it our broadcasts), and we
+						// compute the matching dial proof for its listener.
+						Some(secret) => {
+							let Some(nonce) = info.txt_properties.get_property_val_str(TXT_NONCE) else {
+								continue;
+							};
+							let Some(advert) = info.txt_properties.get_property_val_str(TXT_ADVERT) else {
+								continue;
+							};
+							if !ct_eq(advert, &proof(secret, CONTEXT_ADVERT, nonce, fingerprint)) {
+								tracing::debug!(peer = %id, "peer failed the shared-secret check; ignoring");
+								continue;
+							}
+							proof(secret, CONTEXT_DIAL, nonce, fingerprint)
+						}
 					};
 					let mut addrs: Vec<IpAddr> = info.addresses.iter().map(|addr| addr.to_ip_addr()).collect();
 					// Deterministic order, v4 first: v6 entries are often link-local
@@ -219,7 +283,7 @@ impl Discovery {
 						addrs,
 						port: info.port,
 						fingerprint: fingerprint.to_string(),
-						token: token.to_string(),
+						token,
 					}));
 				}
 				ServiceEvent::ServiceRemoved(_ty, fullname) => {
@@ -258,6 +322,25 @@ fn should_dial(local: &str, remote: &str) -> bool {
 	local < remote
 }
 
+/// An HMAC-SHA256 proof of knowing `secret`, bound to a listener's `nonce` and
+/// certificate `fingerprint` (so it replays nowhere else) and to a `context`
+/// (so the advert and dial roles can't stand in for each other).
+fn proof(secret: &str, context: &str, nonce: &str, fingerprint: &str) -> String {
+	let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+	mac.update(context.as_bytes());
+	mac.update(&[0]);
+	mac.update(nonce.as_bytes());
+	mac.update(&[0]);
+	mac.update(fingerprint.as_bytes());
+	hex::encode(mac.finalize().into_bytes())
+}
+
+/// Constant-time equality, so a proof check can't leak the expected value
+/// byte-by-byte through timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+	a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// The instance portion of a DNS-SD fullname like `<instance>._moq._udp.local.`.
 fn instance_id(fullname: &str) -> Option<&str> {
 	fullname.strip_suffix(SERVICE_TYPE)?.strip_suffix('.')
@@ -274,6 +357,7 @@ fn instance_id(fullname: &str) -> Option<&str> {
 pub struct Mesh {
 	origin: moq_net::origin::Producer,
 	versions: moq_net::Versions,
+	secret: Option<String>,
 }
 
 impl Mesh {
@@ -282,12 +366,20 @@ impl Mesh {
 		Self {
 			origin,
 			versions: moq_net::Versions::all(),
+			secret: None,
 		}
 	}
 
 	/// Restrict the MoQ protocol versions offered on mesh sessions.
 	pub fn with_versions(mut self, versions: moq_net::Versions) -> Self {
 		self.versions = versions;
+		self
+	}
+
+	/// Require a pre-shared secret to join, instead of trusting everyone on
+	/// the network; see [`Config::secret`].
+	pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+		self.secret = Some(secret.into());
 		self
 	}
 
@@ -304,7 +396,9 @@ impl Mesh {
 			.next()
 			.ok_or(Error::NoFingerprint)?;
 
-		let discovery = Discovery::new(Config::new(port, fingerprint))?;
+		let mut config = Config::new(port, fingerprint);
+		config.secret = self.secret;
+		let discovery = Discovery::new(config)?;
 		Ok(Running {
 			origin: self.origin,
 			versions: self.versions,
@@ -425,7 +519,7 @@ fn listener_bind(bind: &str, versions: &moq_net::Versions) -> Result<crate::Serv
 /// (`expected`); the listener is reachable by anyone who can route to the
 /// port, but only discovery hands out the token.
 async fn accept_session(request: crate::Request, origin: moq_net::origin::Producer, expected: &str) -> Result<()> {
-	if request.path() != expected {
+	if !ct_eq(request.path(), expected) {
 		request.close(403).await.ok();
 		return Err(Error::Unauthorized);
 	}
@@ -515,6 +609,24 @@ mod tests {
 		assert!(should_dial("aaaa", "bbbb"));
 		assert!(!should_dial("bbbb", "aaaa"));
 		assert!(!should_dial("aaaa", "aaaa"));
+	}
+
+	/// Each proof is bound to the secret, the role, and the listener's
+	/// nonce + fingerprint, so a proof captured in one place stands in nowhere
+	/// else: a different listener, the advert role, or a different secret all
+	/// produce different values.
+	#[test]
+	fn secret_proofs_are_bound() {
+		let dial = proof("swordfish", CONTEXT_DIAL, "nonce", "fp1");
+		assert_eq!(dial, proof("swordfish", CONTEXT_DIAL, "nonce", "fp1"));
+		assert_ne!(dial, proof("swordfish", CONTEXT_DIAL, "nonce", "fp2"));
+		assert_ne!(dial, proof("swordfish", CONTEXT_DIAL, "other", "fp1"));
+		assert_ne!(dial, proof("swordfish", CONTEXT_ADVERT, "nonce", "fp1"));
+		assert_ne!(dial, proof("hunter2", CONTEXT_DIAL, "nonce", "fp1"));
+
+		assert!(ct_eq(&dial, &dial.clone()));
+		assert!(!ct_eq(&dial, "short"));
+		assert!(!ct_eq(&dial, &proof("hunter2", CONTEXT_DIAL, "nonce", "fp1")));
 	}
 
 	#[test]
@@ -701,6 +813,33 @@ mod tests {
 
 		tokio::spawn(Mesh::new(origin_a.clone()).run());
 		tokio::spawn(Mesh::new(origin_b.clone()).run());
+
+		let mut announced_on_b = origin_b.consume().announced();
+		let update = tokio::time::timeout(TIMEOUT, announced_on_b.next())
+			.await
+			.expect("timed out waiting for discovery + announcement")
+			.expect("origin closed");
+		assert_eq!(update.path.as_str(), "from-a");
+	}
+
+	/// Like [`mesh_discovers_and_connects`], with a shared secret: two meshes
+	/// with the same secret converge. Peers advertising without the secret (or
+	/// with a different one) are mutually invisible by construction, so this
+	/// coexists with the tokenless test on the same host network.
+	#[tokio::test]
+	#[ignore = "needs multicast on the host network; run manually"]
+	async fn mesh_discovers_and_connects_with_secret() {
+		const TIMEOUT: Duration = Duration::from_secs(30);
+
+		let origin_a = moq_net::Origin::random().produce();
+		let origin_b = moq_net::Origin::random().produce();
+
+		let _from_a = origin_a
+			.create_broadcast("from-a", moq_net::broadcast::Route::new().with_announce(true))
+			.expect("failed to create broadcast");
+
+		tokio::spawn(Mesh::new(origin_a.clone()).with_secret("swordfish").run());
+		tokio::spawn(Mesh::new(origin_b.clone()).with_secret("swordfish").run());
 
 		let mut announced_on_b = origin_b.consume().announced();
 		let update = tokio::time::timeout(TIMEOUT, announced_on_b.next())
