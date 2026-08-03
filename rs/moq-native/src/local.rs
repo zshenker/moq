@@ -96,6 +96,11 @@ pub enum Error {
 	#[error("peer did not present the advertised token")]
 	Unauthorized,
 
+	/// The configured shared secret was empty, which would let anyone compute
+	/// valid proofs while the operator believes the mesh is protected.
+	#[error("the shared secret must not be empty")]
+	EmptySecret,
+
 	/// Building the dial URL failed.
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
@@ -180,6 +185,12 @@ impl Discovery {
 	/// The instance id and join token are random per run, so a restarted
 	/// process shows up as a new peer.
 	pub fn new(config: Config) -> Result<Self> {
+		// An empty secret would enable secret mode with a publicly known HMAC
+		// key: protection in appearance only. Fail fast instead.
+		if config.secret.as_deref() == Some("") {
+			return Err(Error::EmptySecret);
+		}
+
 		let id = format!("{:016x}", rand::random::<u64>());
 		let random = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
 
@@ -627,6 +638,14 @@ mod tests {
 		assert!(ct_eq(&dial, &dial.clone()));
 		assert!(!ct_eq(&dial, "short"));
 		assert!(!ct_eq(&dial, &proof("hunter2", CONTEXT_DIAL, "nonce", "fp1")));
+	}
+
+	/// An empty secret would let anyone compute valid proofs; it must be
+	/// rejected up front rather than silently advertising as "protected".
+	#[test]
+	fn rejects_empty_secret() {
+		let err = Discovery::new(Config::new(1, "fp").with_secret("")).err();
+		assert!(matches!(err, Some(Error::EmptySecret)), "{err:?}");
 	}
 
 	#[test]
