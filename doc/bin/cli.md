@@ -148,6 +148,9 @@ broadcasts. With `--cluster-lan` alone nothing leaves the local network;
 adding a bridge shares the same broadcasts with whatever it connects to, in
 both directions.
 
+`transcode` is the exception: it routes through a relay dial only and rejects
+`--cluster-lan`. Omit that flag and use `--client-connect <url>` instead.
+
 Joining the mesh requires a token carried in the mDNS advertisement, so merely
 reaching the QUIC port (say, on a machine with a public address) grants
 nothing. By default anyone on the local network can read the advertisement and

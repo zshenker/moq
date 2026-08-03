@@ -625,11 +625,7 @@ fn authenticated_versions(versions: &moq_net::Versions) -> InternalResult<moq_ne
 	let versions: Vec<_> = versions
 		.iter()
 		.copied()
-		.filter(|version| match version {
-			moq_net::Version::Lite(version) => version.has_setup_stream(),
-			moq_net::Version::Ietf(_) => true,
-			_ => true,
-		})
+		.filter(moq_net::Version::has_request_path)
 		.collect();
 	if versions.is_empty() {
 		return Err(ErrorKind::NoRequestPathVersion);

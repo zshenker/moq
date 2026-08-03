@@ -76,9 +76,7 @@ impl MoqAttachments {
 		} else {
 			None
 		};
-		let mut attachments = Self::new(moq, origin, net)?;
-		attachments.client = client;
-		Ok(attachments)
+		Self::new(moq, origin, net, client)
 	}
 
 	fn export(moq: &MoqSide, origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
@@ -87,21 +85,24 @@ impl MoqAttachments {
 		} else {
 			None
 		};
-		let mut attachments = Self::new(moq, origin, net)?;
-		attachments.client = client;
-		Ok(attachments)
+		Self::new(moq, origin, net, client)
 	}
 
-	fn new(moq: &MoqSide, _origin: &moq_net::origin::Producer, net: &Net) -> anyhow::Result<Self> {
+	fn new(
+		moq: &MoqSide,
+		#[cfg_attr(not(feature = "cluster-lan"), allow(unused_variables))] origin: &moq_net::origin::Producer,
+		net: &Net,
+		client: Option<moq_native::Reconnect>,
+	) -> anyhow::Result<Self> {
 		let server = match moq.server.bind.clone() {
 			Some(bind) => Some((bind, net.server(moq.server.clone())?)),
 			None => None,
 		};
 		#[cfg(feature = "cluster-lan")]
-		let lan = moq.lan_mesh(_origin)?;
+		let lan = moq.lan_mesh(origin)?;
 
 		Ok(Self {
-			client: None,
+			client,
 			server,
 			#[cfg(feature = "cluster-lan")]
 			lan,

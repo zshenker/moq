@@ -48,7 +48,14 @@ pub struct Cli {
 /// without a MoQ side. Every verb that does need one calls
 /// [`validate`](Self::validate).
 #[derive(Args, Clone)]
-#[command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind", "cluster-lan"]))]
+#[cfg_attr(
+	feature = "cluster-lan",
+	command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind", "cluster-lan"]))
+)]
+#[cfg_attr(
+	not(feature = "cluster-lan"),
+	command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind"]))
+)]
 pub struct MoqSide {
 	/// The broadcast name. Optional for the point endpoints (stdin/stdout, HLS
 	/// import, and the `--connect` dials), which default to the root broadcast at
@@ -85,10 +92,12 @@ pub struct MoqSide {
 	///
 	/// LAN advertisements include this identity when configured. The LAN socket
 	/// remains the address peers dial.
+	#[cfg(feature = "cluster-lan")]
 	#[arg(
 		long = "cluster-node",
 		env = "MOQ_CLUSTER_NODE",
 		help_heading = "Cluster",
+		requires = "cluster-lan",
 		value_name = "URL"
 	)]
 	pub cluster_node: Option<url::Url>,
@@ -150,6 +159,10 @@ impl MoqSide {
 	/// discovery is off.
 	#[cfg(feature = "cluster-lan")]
 	pub fn lan_mesh(&self, origin: &moq_net::origin::Producer) -> anyhow::Result<Option<moq_native::lan::Running>> {
+		anyhow::ensure!(
+			self.cluster_node.is_none() || self.lan(),
+			"--cluster-node requires --cluster-lan=true"
+		);
 		anyhow::ensure!(
 			self.cluster_lan_secret.is_none() || self.lan(),
 			"--cluster-lan-secret requires --cluster-lan=true"
@@ -213,10 +226,13 @@ impl MoqSide {
 		let ignored = [
 			("--client-connect", self.client.connect.is_some()),
 			("--server-bind", self.server.bind.is_some()),
-			("--cluster-node", self.cluster_node.is_some()),
 			("--cluster-lan", self.lan()),
 			("--broadcast", self.broadcast.is_some()),
 		];
+		#[cfg(feature = "cluster-lan")]
+		if self.cluster_node.is_some() {
+			anyhow::bail!("`{command}` runs locally and takes no MoQ side; drop --cluster-node");
+		}
 
 		if let Some((flag, _)) = ignored.into_iter().find(|(_, given)| *given) {
 			anyhow::bail!("`{command}` runs locally and takes no MoQ side; drop {flag}");
@@ -230,8 +246,12 @@ impl MoqSide {
 	/// dial only.
 	#[cfg(feature = "transcode")]
 	pub fn reject_lan(&self, command: &str) -> anyhow::Result<()> {
+		#[cfg(feature = "cluster-lan")]
+		let enabled = self.lan() || self.cluster_node.is_some();
+		#[cfg(not(feature = "cluster-lan"))]
+		let enabled = false;
 		anyhow::ensure!(
-			!self.lan(),
+			!enabled,
 			"`{command}` does not join the LAN mesh; drop --cluster-lan and pass --client-connect <url>"
 		);
 		Ok(())
@@ -474,6 +494,39 @@ mod tests {
 		let cli = Cli::try_parse_from(["moq", "--cluster-lan", "--cluster-lan-secret", path, "import", "ts"])
 			.expect("key file should parse");
 		assert_eq!(cli.moq.lan_secret().unwrap(), Some(expected));
+
+		let malformed = tempfile::NamedTempFile::new().expect("create temporary key file");
+		std::fs::write(malformed.path(), "not-a-key\n").expect("write temporary key file");
+		let path = malformed.path().to_str().expect("UTF-8 temporary path");
+		let cli = Cli::try_parse_from(["moq", "--cluster-lan", "--cluster-lan-secret", path, "import", "ts"])
+			.expect("malformed key file path should parse as an argument");
+		let err = cli.moq.lan_secret().unwrap_err().to_string();
+		assert!(err.contains("64 hexadecimal characters"), "{err}");
+
+		let err = Cli::try_parse_from(["moq", "--cluster-node", "moqt://relay.example.com:4443", "import", "ts"])
+			.err()
+			.expect("cluster node should require explicit LAN activation")
+			.to_string();
+		assert!(err.contains("--cluster-lan"), "{err}");
+		let cli = Cli::try_parse_from([
+			"moq",
+			"--cluster-lan=false",
+			"--cluster-node",
+			"moqt://relay.example.com:4443",
+			"--client-connect",
+			"https://relay.example.com/anon",
+			"import",
+			"ts",
+		])
+		.expect("an explicit false LAN value should satisfy argument presence");
+		let origin = moq_net::Origin::random().produce();
+		let err = cli
+			.moq
+			.lan_mesh(&origin)
+			.err()
+			.expect("cluster node with disabled LAN must fail")
+			.to_string();
+		assert!(err.contains("--cluster-lan=true"), "{err}");
 
 		let cli = Cli::try_parse_from([
 			"moq",

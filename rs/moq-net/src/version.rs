@@ -142,6 +142,14 @@ impl Version {
 		)
 	}
 
+	/// Whether this version can carry a request path in-band on URI-less transports.
+	pub fn has_request_path(&self) -> bool {
+		match self {
+			Self::Lite(version) => version.has_setup_stream(),
+			Self::Ietf(_) => true,
+		}
+	}
+
 	/// Whether this is a lite protocol version.
 	pub fn is_lite(&self) -> bool {
 		match self {
