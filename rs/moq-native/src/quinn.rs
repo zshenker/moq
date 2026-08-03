@@ -235,11 +235,16 @@ pub(crate) struct QuinnClient {
 	pub http_bootstrap: bool,
 	/// Optional TLS SNI / verification hostname override (from config).
 	pub host_name: Option<String>,
+	/// Whether the bound socket really came back dual-stack, which decides
+	/// whether an IPv4 destination is reachable at all. Captured here because the
+	/// endpoint owns the socket from here on and `local_addr` can't tell us.
+	dual_stack: bool,
 }
 
 impl QuinnClient {
 	pub fn new(config: &ClientConfig) -> Result<Self> {
 		let socket = crate::bind::udp(config.bind).map_err(Error::BindSocket)?;
+		let dual_stack = crate::bind::udp_is_dual_stack(&socket);
 
 		let quic = config.quic.resolve();
 		let mut transport = quinn::TransportConfig::default();
@@ -259,6 +264,7 @@ impl QuinnClient {
 			transport,
 			http_bootstrap: config.tls.allows_http_bootstrap(),
 			host_name: config.tls.host_name.clone(),
+			dual_stack,
 		})
 	}
 
@@ -268,22 +274,29 @@ impl QuinnClient {
 		url: Url,
 		versions: &moq_net::Versions,
 	) -> Result<web_transport_quinn::Session> {
-		let mut url = url;
-		let mut config = tls.clone();
-
 		let host = url.host().ok_or(Error::InvalidDnsName)?.to_string();
 		let port = url.port().unwrap_or(443);
 
-		// Look up the DNS entry.
-		// Quinn doesn't support happy eyeballs, so we pick a single address,
-		// preferring one whose family matches the local socket so the OS
-		// doesn't reject it (notably on Windows, where IPv6 sockets aren't
-		// dual-stack by default).
+		// Look up the DNS entry. Quinn doesn't support happy eyeballs, so we commit to
+		// a single address; `pick_addr` documents how that one is chosen.
 		let local = self.quic.local_addr().map_err(Error::LocalAddr)?;
 		let addrs = tokio::net::lookup_host((host.clone(), port))
 			.await
 			.map_err(Error::DnsLookup)?;
-		let ip = crate::util::pick_addr(addrs, local).ok_or(Error::NoDnsEntries)?;
+		let ip = crate::util::pick_addr(addrs, local, self.dual_stack).ok_or(Error::NoDnsEntries)?;
+		self.connect_addr(tls, url, versions, ip).await
+	}
+
+	pub async fn connect_addr(
+		&self,
+		tls: &rustls::ClientConfig,
+		url: Url,
+		versions: &moq_net::Versions,
+		ip: net::SocketAddr,
+	) -> Result<web_transport_quinn::Session> {
+		let mut url = url;
+		let mut config = tls.clone();
+		let host = url.host().ok_or(Error::InvalidDnsName)?.to_string();
 
 		if url.scheme() == "http" {
 			// Insecure per-connection bootstrap: only honored when no stronger

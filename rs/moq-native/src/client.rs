@@ -334,6 +334,26 @@ impl Client {
 		Ok(crate::spawn_session(pair))
 	}
 
+	/// Dial a known socket address while keeping `url` as the protocol request target.
+	///
+	/// Local discovery uses this to preserve an IPv6 interface scope that cannot
+	/// be represented in a URL host.
+	#[cfg(feature = "local")]
+	pub(crate) async fn connect_addr(&self, mut url: Url, addr: net::SocketAddr) -> crate::Result<moq_net::Session> {
+		let moq = self.moq_with_path(setup_path(&url));
+		// Raw QUIC carries the path in MoQ SETUP. Keep the membership proof out
+		// of the transport request and its debug log once it has been extracted.
+		url.set_path("/");
+		let quinn = self
+			.quinn
+			.as_ref()
+			.ok_or(Error::NoBackend("local discovery requires the quinn backend"))?;
+		let transport = quinn.connect_addr(&self.tls, url, &self.versions, addr).await?;
+		let pair = moq.connect(transport).await?;
+		tracing::info!(version = %pair.0.version(), "connected");
+		Ok(crate::spawn_session(pair))
+	}
+
 	/// The moq client builder, advertising `path` in the SETUP when there is one.
 	#[cfg(any(
 		feature = "noq",

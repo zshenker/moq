@@ -2,15 +2,16 @@
 //!
 //! Grammar: `moq <MoQ side> <import|export> <endpoint> [endpoint opts]`.
 //!
-//! - The MoQ side (`--client-connect` / `--server-bind`, both optional, at least
-//!   one) attaches the shared Origin to the MoQ network, and comes before the
-//!   verb. Both may be given: dial a relay *and* accept incoming sessions.
+//! - The MoQ side (`--client-connect`, `--server-bind`, or `--client-discover`)
+//!   attaches the shared Origin to the MoQ network and comes before the verb.
+//!   They compose, so a process can dial, accept, and join the local mesh.
 //! - `import` routes media INTO MoQ from one source; `export` routes it OUT to
 //!   one sink. The verb fixes the data direction (and thus, for the
 //!   bidirectional gateways, whether `--connect`/`--listen` push or pull).
-//! - `devices` touches no network at all, so it's the one verb that takes no MoQ
-//!   side. That's why the requirement is enforced per-verb ([`MoqSide::validate`])
-//!   rather than by clap: an `ArgGroup` can't be conditional on the subcommand.
+//! - `devices` and `token` touch no network at all, so they're the verbs that take
+//!   no MoQ side. That's why the requirement is enforced per-verb
+//!   ([`MoqSide::validate`]) rather than by clap: an `ArgGroup` can't be
+//!   conditional on the subcommand.
 //! - The endpoint is one subcommand: a container format (`ts`, `fmp4`, ... read
 //!   from stdin on import, written to stdout on export) or a gateway (`hls`,
 //!   `rtmp`, `srt`, `rtc`). Exactly one per invocation, so "which endpoint" is
@@ -41,11 +42,11 @@ pub struct Cli {
 	pub command: Command,
 }
 
-/// The MoQ attachment. At least one of `--client-connect` / `--server-bind`;
-/// both may be given at once.
+/// The MoQ attachment: a relay dial, server listener, local mesh, or combination.
 ///
-/// The group is not `required`, because `devices` runs without a MoQ side. Every
-/// verb that does need one calls [`validate`](Self::validate).
+/// The group is not `required`, because the local verbs (`token`, `devices`) run
+/// without a MoQ side. Every verb that does need one calls
+/// [`validate`](Self::validate).
 #[derive(Args, Clone)]
 #[command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind"]))]
 pub struct MoqSide {
@@ -109,7 +110,7 @@ pub struct MoqSide {
 		env = "MOQ_CLIENT_DISCOVER_SECRET",
 		help_heading = "MoQ"
 	)]
-	pub discover_secret: Option<String>,
+	pub discover_secret: Option<moq_native::local::Secret>,
 }
 
 impl MoqSide {
@@ -161,13 +162,24 @@ impl MoqSide {
 	}
 
 	/// Reject the MoQ flags on a verb that never touches the network, rather than
-	/// silently ignoring them. Only `devices` qualifies, hence the gate.
-	#[cfg(feature = "capture")]
+	/// silently ignoring them. `--broadcast` counts: a local verb has no content, and
+	/// next to `token generate` it reads like it scopes the key, which `--root` does.
+	///
+	/// `--origin` is left out on purpose. It reads `MOQ_ORIGIN`, so rejecting it would
+	/// fail `moq token` in any shell that exports the variable for a publisher, and an
+	/// ambient env value is not the deliberate request this is meant to catch.
 	pub fn reject(&self, command: &str) -> anyhow::Result<()> {
-		anyhow::ensure!(
-			self.client.connect.is_none() && self.server.bind.is_none() && !self.discover(),
-			"`{command}` runs locally and takes no MoQ side; drop --client-connect / --server-bind / --client-discover"
-		);
+		let ignored = [
+			("--client-connect", self.client.connect.is_some()),
+			("--server-bind", self.server.bind.is_some()),
+			("--client-discover", self.discover()),
+			("--broadcast", self.broadcast.is_some()),
+		];
+
+		if let Some((flag, _)) = ignored.into_iter().find(|(_, given)| *given) {
+			anyhow::bail!("`{command}` runs locally and takes no MoQ side; drop {flag}");
+		}
+
 		Ok(())
 	}
 
@@ -198,6 +210,8 @@ pub enum Command {
 	/// only encoded while watched (just-in-time).
 	#[cfg(feature = "transcode")]
 	Transcode(crate::transcode::Args),
+	/// Generate, sign, and verify the JWT tokens a relay authenticates with.
+	Token(moq_token_cli::Args),
 	/// List the capture devices `import capture` can name.
 	#[cfg(feature = "capture")]
 	Devices,
@@ -334,4 +348,59 @@ pub struct Fragmented {
 	/// Cap the output fragment/cluster duration (e.g. `2s`). Default: one GOP.
 	#[arg(long, value_parser = humantime::parse_duration)]
 	pub fragment_duration: Option<Duration>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use clap::CommandFactory;
+
+	// Catches the conflicts clap only panics on at runtime: a duplicate long, a
+	// dangling `conflicts_with`, a flattened arg colliding with an existing one.
+	// The token verb flattens a whole command tree from another crate, so this is
+	// the only thing standing between a rename there and a broken `moq`.
+	#[test]
+	fn valid() {
+		Cli::command().debug_assert();
+	}
+
+	#[test]
+	fn token_verb() {
+		let cli = Cli::try_parse_from(["moq", "token", "generate", "--algorithm", "ES256"]).unwrap();
+		assert!(matches!(cli.command, Command::Token(_)));
+		// Local verb: it needs no MoQ side, so what every other verb demands...
+		assert!(cli.moq.validate().is_err());
+		assert!(cli.moq.reject("token").is_ok());
+
+		// ...these it refuses, rather than accepting the flag and ignoring it.
+		for flag in [
+			["--client-connect", "https://relay.example.com"],
+			["--broadcast", "room"],
+		] {
+			let cli = Cli::try_parse_from(["moq", flag[0], flag[1], "token", "generate"]).unwrap();
+			let err = cli.moq.reject("token").unwrap_err().to_string();
+			assert!(err.contains(flag[0]), "{err}");
+		}
+
+		#[cfg(feature = "local")]
+		{
+			let cli = Cli::try_parse_from(["moq", "--client-discover", "token", "generate"]).unwrap();
+			let err = cli.moq.reject("token").unwrap_err().to_string();
+			assert!(err.contains("--client-discover"), "{err}");
+		}
+	}
+
+	#[cfg(feature = "local")]
+	#[test]
+	fn discovery_secret_is_non_empty_and_implies_discovery() {
+		let cli = Cli::try_parse_from(["moq", "--client-discover-secret", "swordfish", "import", "ts"]).unwrap();
+		assert!(cli.moq.discover());
+		assert!(cli.moq.validate().is_ok());
+
+		let err = Cli::try_parse_from(["moq", "--client-discover-secret", "", "import", "ts"])
+			.err()
+			.expect("an empty secret must be rejected")
+			.to_string();
+		assert!(err.contains("must not be empty"), "{err}");
+	}
 }

@@ -7,6 +7,7 @@
 //! - Plain TCP via the `tcp://` scheme (qmux, no TLS; requires `tcp` feature)
 //! - Unix domain socket via the `unix://` scheme (qmux, peer-credential aware; requires `uds` feature, unix-only)
 //! - Iroh P2P (requires `iroh` feature)
+//! - Local-network mDNS mesh (requires `local` feature)
 //!
 //! See [`Client`] for connecting to relays and [`Server`] for accepting connections.
 

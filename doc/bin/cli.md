@@ -103,6 +103,11 @@ moq <MoQ side>  <import|export>  <endpoint> [endpoint options]
 Run `moq import --help` / `moq export --help` to see the endpoints, and
 `moq import rtmp --help` for a specific one.
 
+Two verbs sit outside this grammar because they never touch the network:
+[`moq token`](#authentication) manages relay JWTs, and `moq devices` lists the
+capture devices in a build with the `capture` feature enabled. Both take no MoQ
+side and reject one if given.
+
 ## Basic Usage
 
 `moq <MoQ side> import <format>` reads a container from stdin;
@@ -154,7 +159,7 @@ joining then requires knowing the secret, peers without it are invisible, and
 the secret itself never travels the network (peers exchange HMAC proofs bound
 to each listener, so nothing observed or received can be replayed elsewhere).
 Pick a strong secret; a weak one can be brute-forced offline from the
-advertisement.
+advertisement. Empty secrets are rejected.
 
 ### Redundant Publishers (1+1)
 
@@ -580,7 +585,26 @@ ffmpeg -i video.mp4 -c copy -f mpegts - | \
     moq --client-connect "https://relay.example.com/?jwt=<token>" --broadcast my-stream.hang import ts
 ```
 
-See [Authentication](/bin/relay/auth) for token generation.
+`moq token` mints those tokens, so a relay operator needs no extra tool:
+
+```bash
+# Generate a signing key. Only private.jwk has to stay secret; the relay
+# verifies with public.jwk.
+moq token generate --algorithm ES256 --out private.jwk --public public.jwk
+
+# Sign a token letting the bearer publish `rooms/123/alice` and watch the room.
+# Add `--expires <unix-timestamp>` to bound how long it stays valid.
+moq token sign --key private.jwk \
+    --root "rooms/123" \
+    --publish "alice" \
+    --subscribe "" > alice.jwt
+
+# Inspect a token's claims.
+moq token verify --key public.jwk --in alice.jwt
+```
+
+See [Authentication](/bin/relay/auth) for the key formats, scoping rules, and
+relay configuration.
 
 ## Test Videos
 

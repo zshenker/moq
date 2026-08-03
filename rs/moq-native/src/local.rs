@@ -26,11 +26,14 @@
 //! Peers with a different secret (or none) are mutually invisible.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::fmt;
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::str::FromStr;
 use std::time::Duration;
 
 use hmac::{KeyInit, Mac};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use subtle::ConstantTimeEq;
 use url::Url;
 
 // Re-exported because [`Error::Mdns`] carries its error type, so consumers can
@@ -96,6 +99,10 @@ pub enum Error {
 	#[error("peer did not present the advertised token")]
 	Unauthorized,
 
+	/// A shared secret was empty and would provide no authentication.
+	#[error("local discovery secret must not be empty")]
+	EmptySecret,
+
 	/// Building the dial URL failed.
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
@@ -103,19 +110,63 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// A validated pre-shared secret for authenticating local mesh membership.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+	/// Validate a non-empty shared secret.
+	pub fn new(secret: impl Into<String>) -> Result<Self> {
+		let secret = secret.into();
+		if secret.is_empty() {
+			return Err(Error::EmptySecret);
+		}
+		Ok(Self(secret))
+	}
+
+	fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+impl fmt::Debug for Secret {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("Secret([redacted])")
+	}
+}
+
+impl FromStr for Secret {
+	type Err = Error;
+
+	fn from_str(secret: &str) -> Result<Self> {
+		Self::new(secret)
+	}
+}
+
 /// A MoQ process discovered on the local network.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Peer {
 	/// The peer's advertised instance id, opaque and unique per run.
 	pub id: String,
-	/// The addresses the peer advertised.
-	pub addrs: Vec<IpAddr>,
-	/// The peer's QUIC port.
-	pub port: u16,
+	/// The socket addresses the peer advertised, including IPv6 scope ids.
+	pub addrs: Vec<SocketAddr>,
 	/// The hex SHA-256 fingerprint of the peer's certificate, to pin when dialing.
 	pub fingerprint: String,
 	/// The join token to present when dialing, proving we saw the advertisement.
 	pub token: String,
+}
+
+impl fmt::Debug for Peer {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("Peer")
+			.field("id", &self.id)
+			.field("addrs", &self.addrs)
+			.field("fingerprint", &self.fingerprint)
+			.field("token", &"[redacted]")
+			.finish()
+	}
 }
 
 /// What [`Discovery`] advertises: the listener peers dial to reach this process.
@@ -131,7 +182,7 @@ pub struct Config {
 	/// invisible. The advertisement carries an HMAC over a public nonce, so a
 	/// weak secret can be brute-forced offline by anyone on the network; pick a
 	/// strong one.
-	pub secret: Option<String>,
+	pub secret: Option<Secret>,
 }
 
 impl Config {
@@ -145,8 +196,8 @@ impl Config {
 	}
 
 	/// Require [`secret`](Self::secret) to join the mesh.
-	pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
-		self.secret = Some(secret.into());
+	pub fn with_secret(mut self, secret: Secret) -> Self {
+		self.secret = Some(secret);
 		self
 	}
 }
@@ -169,7 +220,7 @@ pub enum Event {
 pub struct Discovery {
 	id: String,
 	token: String,
-	secret: Option<String>,
+	secret: Option<Secret>,
 	daemon: ServiceDaemon,
 	events: mdns_sd::Receiver<ServiceEvent>,
 }
@@ -250,38 +301,27 @@ impl Discovery {
 					let Some(fingerprint) = info.txt_properties.get_property_val_str(TXT_FINGERPRINT) else {
 						continue;
 					};
-					let token = match &self.secret {
-						// Bearer mode: dial with whatever the peer advertised.
-						// A peer advertising in secret mode has no token; skip it.
-						None => match info.txt_properties.get_property_val_str(TXT_TOKEN) {
-							Some(token) => token.to_string(),
-							None => continue,
-						},
-						// Secret mode: the peer must prove it knows our secret
-						// before we dial it (and hand it our broadcasts), and we
-						// compute the matching dial proof for its listener.
-						Some(secret) => {
-							let Some(nonce) = info.txt_properties.get_property_val_str(TXT_NONCE) else {
-								continue;
-							};
-							let Some(advert) = info.txt_properties.get_property_val_str(TXT_ADVERT) else {
-								continue;
-							};
-							if !ct_eq(advert, &proof(secret, CONTEXT_ADVERT, nonce, fingerprint)) {
-								tracing::debug!(peer = %id, "peer failed the shared-secret check; ignoring");
-								continue;
-							}
-							proof(secret, CONTEXT_DIAL, nonce, fingerprint)
-						}
+					let advert = Advertisement {
+						fingerprint,
+						token: info.txt_properties.get_property_val_str(TXT_TOKEN),
+						nonce: info.txt_properties.get_property_val_str(TXT_NONCE),
+						proof: info.txt_properties.get_property_val_str(TXT_ADVERT),
 					};
-					let mut addrs: Vec<IpAddr> = info.addresses.iter().map(|addr| addr.to_ip_addr()).collect();
-					// Deterministic order, v4 first: v6 entries are often link-local
-					// and need a scope id we don't have.
+					let token = dial_token(self.secret.as_ref(), advert);
+					let Some(token) = token else {
+						tracing::debug!(peer = %id, "peer failed the membership check; ignoring");
+						continue;
+					};
+					let mut addrs: Vec<SocketAddr> = info
+						.addresses
+						.iter()
+						.map(|addr| discovered_addr(addr, info.port))
+						.collect();
+					// Deterministic order, preferring IPv4 when both families are advertised.
 					addrs.sort_by_key(|addr| (addr.is_ipv6(), *addr));
 					return Some(Event::Found(Peer {
 						id: id.to_string(),
 						addrs,
-						port: info.port,
 						fingerprint: fingerprint.to_string(),
 						token,
 					}));
@@ -322,11 +362,29 @@ fn should_dial(local: &str, remote: &str) -> bool {
 	local < remote
 }
 
+/// Turn an mDNS address into a dial target without discarding an IPv6
+/// interface scope.
+fn discovered_addr(addr: &mdns_sd::ScopedIp, port: u16) -> SocketAddr {
+	match addr {
+		mdns_sd::ScopedIp::V4(addr) => scoped_addr(IpAddr::V4(*addr.addr()), port, 0),
+		mdns_sd::ScopedIp::V6(addr) => scoped_addr(IpAddr::V6(*addr.addr()), port, addr.scope_id().index),
+		_ => scoped_addr(addr.to_ip_addr(), port, 0),
+	}
+}
+
+fn scoped_addr(addr: IpAddr, port: u16, scope_id: u32) -> SocketAddr {
+	match addr {
+		IpAddr::V4(addr) => SocketAddr::new(IpAddr::V4(addr), port),
+		IpAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(addr, port, 0, scope_id)),
+	}
+}
+
 /// An HMAC-SHA256 proof of knowing `secret`, bound to a listener's `nonce` and
 /// certificate `fingerprint` (so it replays nowhere else) and to a `context`
 /// (so the advert and dial roles can't stand in for each other).
-fn proof(secret: &str, context: &str, nonce: &str, fingerprint: &str) -> String {
-	let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+fn proof(secret: &Secret, context: &str, nonce: &str, fingerprint: &str) -> String {
+	let mut mac =
+		hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_str().as_bytes()).expect("HMAC accepts any key length");
 	mac.update(context.as_bytes());
 	mac.update(&[0]);
 	mac.update(nonce.as_bytes());
@@ -335,10 +393,30 @@ fn proof(secret: &str, context: &str, nonce: &str, fingerprint: &str) -> String 
 	hex::encode(mac.finalize().into_bytes())
 }
 
+/// The membership fields carried by one peer's advertisement.
+struct Advertisement<'a> {
+	fingerprint: &'a str,
+	token: Option<&'a str>,
+	nonce: Option<&'a str>,
+	proof: Option<&'a str>,
+}
+
+/// Return the credential to present, or ignore a peer in a different membership mode.
+fn dial_token(secret: Option<&Secret>, advert: Advertisement<'_>) -> Option<String> {
+	match secret {
+		None => advert.token.map(str::to_string),
+		Some(secret) => {
+			let (nonce, presented) = (advert.nonce?, advert.proof?);
+			ct_eq(presented, &proof(secret, CONTEXT_ADVERT, nonce, advert.fingerprint))
+				.then(|| proof(secret, CONTEXT_DIAL, nonce, advert.fingerprint))
+		}
+	}
+}
+
 /// Constant-time equality, so a proof check can't leak the expected value
 /// byte-by-byte through timing.
 fn ct_eq(a: &str, b: &str) -> bool {
-	a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+	a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
 /// The instance portion of a DNS-SD fullname like `<instance>._moq._udp.local.`.
@@ -357,7 +435,7 @@ fn instance_id(fullname: &str) -> Option<&str> {
 pub struct Mesh {
 	origin: moq_net::origin::Producer,
 	versions: moq_net::Versions,
-	secret: Option<String>,
+	secret: Option<Secret>,
 }
 
 impl Mesh {
@@ -378,8 +456,8 @@ impl Mesh {
 
 	/// Require a pre-shared secret to join, instead of trusting everyone on
 	/// the network; see [`Config::secret`].
-	pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
-		self.secret = Some(secret.into());
+	pub fn with_secret(mut self, secret: Secret) -> Self {
+		self.secret = Some(secret);
 		self
 	}
 
@@ -407,8 +485,8 @@ impl Mesh {
 		})
 	}
 
-	/// [`start`](Self::start) and [`run`](Running::run) in one call: discover,
-	/// dial, and accept peers until interrupted (Ctrl-C).
+	/// [`start`](Self::start) and [`run`](Running::run) in one call, completing
+	/// when discovery or the listener shuts down.
 	pub async fn run(self) -> Result<()> {
 		self.start()?.run().await
 	}
@@ -423,7 +501,7 @@ pub struct Running {
 }
 
 impl Running {
-	/// Discover, dial, and accept peers until interrupted (Ctrl-C).
+	/// Discover, dial, and accept peers until discovery or the listener shuts down.
 	///
 	/// A lost peer (mDNS expiry) has its dial aborted; a dropped session to a
 	/// still-advertised peer reconnects with backoff.
@@ -452,9 +530,8 @@ impl Running {
 							}
 							None => tracing::info!(peer = %peer.id, "discovered local peer; dialing"),
 						}
-						let origin = self.origin.clone();
-						let versions = self.versions.clone();
-						let handle = tasks.spawn(dial_peer(origin, versions, peer.clone()));
+						let dialer = Dialer::new(self.origin.clone(), self.versions.clone());
+						let handle = tasks.spawn(dialer.run(peer.clone()));
 						dials.insert(peer.id.clone(), Dial { handle, peer });
 					}
 					Some(Event::Lost(id)) => {
@@ -499,7 +576,10 @@ struct Dial {
 fn listener(versions: &moq_net::Versions) -> Result<crate::Server> {
 	match listener_bind("[::]:0", versions) {
 		Ok(server) => Ok(server),
-		Err(_) => listener_bind("0.0.0.0:0", versions),
+		Err(err) => {
+			tracing::debug!(%err, "failed to bind the local mesh over IPv6; falling back to IPv4");
+			listener_bind("0.0.0.0:0", versions)
+		}
 	}
 }
 
@@ -532,70 +612,79 @@ async fn accept_session(request: crate::Request, origin: moq_net::origin::Produc
 	Err(session.closed().await.into())
 }
 
-/// Keep one session to `peer` alive, reconnecting with backoff until aborted.
-async fn dial_peer(origin: moq_net::origin::Producer, versions: moq_net::Versions, peer: Peer) {
-	let mut backoff = DIAL_BACKOFF_BASE;
-
-	loop {
-		let started = tokio::time::Instant::now();
-		if let Err(err) = dial_session(&origin, &versions, &peer).await {
-			tracing::warn!(%err, peer = %peer.id, "local peer session ended; will retry");
-		}
-		backoff = match started.elapsed() >= DIAL_STABLE {
-			true => DIAL_BACKOFF_BASE,
-			false => (backoff * 2).min(DIAL_BACKOFF_MAX),
-		};
-		tokio::time::sleep(backoff).await;
-	}
+/// The state shared by every connection attempt to one discovered peer.
+struct Dialer {
+	origin: moq_net::origin::Producer,
+	versions: moq_net::Versions,
 }
 
-/// Dial `peer` on the first reachable advertised address, run the
-/// bidirectional session, and wait for it to close.
-async fn dial_session(origin: &moq_net::origin::Producer, versions: &moq_net::Versions, peer: &Peer) -> Result<()> {
-	let mut last: Option<Error> = None;
+impl Dialer {
+	fn new(origin: moq_net::origin::Producer, versions: moq_net::Versions) -> Self {
+		Self { origin, versions }
+	}
 
-	for addr in &peer.addrs {
-		let session = match dial_addr(origin, versions, peer, *addr).await {
-			Ok(session) => session,
-			Err(err) => {
-				last = Some(err);
-				continue;
+	/// Keep one session to `peer` alive, reconnecting with backoff until aborted.
+	async fn run(self, peer: Peer) {
+		let mut backoff = DIAL_BACKOFF_BASE;
+
+		loop {
+			let started = tokio::time::Instant::now();
+			if let Err(err) = self.connect(&peer).await {
+				tracing::warn!(%err, peer = %peer.id, "local peer session ended; will retry");
 			}
+			backoff = match started.elapsed() >= DIAL_STABLE {
+				true => DIAL_BACKOFF_BASE,
+				false => (backoff * 2).min(DIAL_BACKOFF_MAX),
+			};
+			tokio::time::sleep(backoff).await;
+		}
+	}
+
+	/// Dial `peer` on the first reachable advertised address and wait for it to close.
+	async fn connect(&self, peer: &Peer) -> Result<()> {
+		let mut last: Option<Error> = None;
+
+		for addr in &peer.addrs {
+			let session = match self.connect_addr(peer, *addr).await {
+				Ok(session) => session,
+				Err(err) => {
+					last = Some(err);
+					continue;
+				}
+			};
+			return Err(session.closed().await.into());
+		}
+
+		Err(last.unwrap_or(Error::NoAddress))
+	}
+
+	/// One raw QUIC attempt to `addr`, pinning the peer's fingerprint.
+	async fn connect_addr(&self, peer: &Peer, addr: SocketAddr) -> Result<moq_net::Session> {
+		let mut config = crate::ClientConfig {
+			// Match the bind family to the target so a v4-only host can dial.
+			bind: match addr {
+				SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid address"),
+				SocketAddr::V6(_) => "[::]:0".parse().expect("valid address"),
+			},
+			..Default::default()
 		};
-		return Err(session.closed().await.into());
+		config.tls.fingerprint = vec![peer.fingerprint.clone()];
+		config.version = self.versions.iter().copied().collect();
+
+		// The peer's join token rides as the request path (the SETUP for raw QUIC),
+		// proving this dial came through discovery.
+		let url: Url = match addr.ip() {
+			IpAddr::V6(ip) => format!("moqt://[{ip}]:{}/{}", addr.port(), peer.token),
+			IpAddr::V4(ip) => format!("moqt://{ip}:{}/{}", addr.port(), peer.token),
+		}
+		.parse()?;
+
+		let client = config
+			.init()?
+			.with_publisher(&self.origin)
+			.with_subscriber(self.origin.clone());
+		Ok(client.connect_addr(url, addr).await?)
 	}
-
-	Err(last.unwrap_or(Error::NoAddress))
-}
-
-/// One connection attempt: raw QUIC to `addr`, pinning the peer's fingerprint.
-async fn dial_addr(
-	origin: &moq_net::origin::Producer,
-	versions: &moq_net::Versions,
-	peer: &Peer,
-	addr: IpAddr,
-) -> Result<moq_net::Session> {
-	let mut config = crate::ClientConfig {
-		// Match the bind family to the target so a v4-only host can dial.
-		bind: match addr {
-			IpAddr::V4(_) => "0.0.0.0:0".parse().expect("valid address"),
-			IpAddr::V6(_) => "[::]:0".parse().expect("valid address"),
-		},
-		..Default::default()
-	};
-	config.tls.fingerprint = vec![peer.fingerprint.clone()];
-	config.version = versions.iter().copied().collect();
-
-	// The peer's join token rides as the request path (the SETUP for raw QUIC),
-	// proving this dial came through discovery.
-	let url: Url = match addr {
-		IpAddr::V6(_) => format!("moqt://[{addr}]:{}/{}", peer.port, peer.token),
-		IpAddr::V4(_) => format!("moqt://{addr}:{}/{}", peer.port, peer.token),
-	}
-	.parse()?;
-
-	let client = config.init()?.with_publisher(origin).with_subscriber(origin.clone());
-	Ok(client.connect(url).await?)
 }
 
 #[cfg(test)]
@@ -617,16 +706,57 @@ mod tests {
 	/// produce different values.
 	#[test]
 	fn secret_proofs_are_bound() {
-		let dial = proof("swordfish", CONTEXT_DIAL, "nonce", "fp1");
-		assert_eq!(dial, proof("swordfish", CONTEXT_DIAL, "nonce", "fp1"));
-		assert_ne!(dial, proof("swordfish", CONTEXT_DIAL, "nonce", "fp2"));
-		assert_ne!(dial, proof("swordfish", CONTEXT_DIAL, "other", "fp1"));
-		assert_ne!(dial, proof("swordfish", CONTEXT_ADVERT, "nonce", "fp1"));
-		assert_ne!(dial, proof("hunter2", CONTEXT_DIAL, "nonce", "fp1"));
+		let swordfish = Secret::new("swordfish").expect("valid secret");
+		let hunter2 = Secret::new("hunter2").expect("valid secret");
+		let dial = proof(&swordfish, CONTEXT_DIAL, "nonce", "fp1");
+		assert_eq!(dial, proof(&swordfish, CONTEXT_DIAL, "nonce", "fp1"));
+		assert_ne!(dial, proof(&swordfish, CONTEXT_DIAL, "nonce", "fp2"));
+		assert_ne!(dial, proof(&swordfish, CONTEXT_DIAL, "other", "fp1"));
+		assert_ne!(dial, proof(&swordfish, CONTEXT_ADVERT, "nonce", "fp1"));
+		assert_ne!(dial, proof(&hunter2, CONTEXT_DIAL, "nonce", "fp1"));
 
 		assert!(ct_eq(&dial, &dial.clone()));
 		assert!(!ct_eq(&dial, "short"));
-		assert!(!ct_eq(&dial, &proof("hunter2", CONTEXT_DIAL, "nonce", "fp1")));
+		assert!(!ct_eq(&dial, &proof(&hunter2, CONTEXT_DIAL, "nonce", "fp1")));
+	}
+
+	#[test]
+	fn dial_token_filters_membership_modes_and_proofs() {
+		let secret = Secret::new("swordfish").expect("valid secret");
+		let other = Secret::new("hunter2").expect("valid secret");
+		let advert = proof(&secret, CONTEXT_ADVERT, "nonce", "fingerprint");
+		let expected = proof(&secret, CONTEXT_DIAL, "nonce", "fingerprint");
+		let membership = |token, nonce, proof| Advertisement {
+			fingerprint: "fingerprint",
+			token,
+			nonce,
+			proof,
+		};
+
+		assert_eq!(
+			dial_token(None, membership(Some("bearer"), None, None)),
+			Some("bearer".into())
+		);
+		assert_eq!(dial_token(None, membership(None, Some("nonce"), Some(&advert))), None);
+		assert_eq!(
+			dial_token(Some(&secret), membership(None, Some("nonce"), Some(&advert))),
+			Some(expected)
+		);
+		assert_eq!(dial_token(Some(&secret), membership(Some("bearer"), None, None)), None);
+		assert_eq!(dial_token(Some(&secret), membership(None, None, Some(&advert))), None);
+		assert_eq!(dial_token(Some(&secret), membership(None, Some("nonce"), None)), None);
+
+		let wrong = proof(&other, CONTEXT_ADVERT, "nonce", "fingerprint");
+		assert_eq!(
+			dial_token(Some(&secret), membership(None, Some("nonce"), Some(&wrong))),
+			None
+		);
+	}
+
+	#[test]
+	fn secret_rejects_empty_values() {
+		assert!(matches!(Secret::new(""), Err(Error::EmptySecret)));
+		assert_eq!(format!("{:?}", Secret::new("swordfish").unwrap()), "Secret([redacted])");
 	}
 
 	#[test]
@@ -637,6 +767,15 @@ mod tests {
 		);
 		assert_eq!(instance_id("weird name._moq._udp.local."), Some("weird name"));
 		assert_eq!(instance_id("not-a-moq-service._http._tcp.local."), None);
+	}
+
+	#[test]
+	fn ipv6_dial_target_preserves_scope_id() {
+		let addr = scoped_addr("fe80::1".parse().expect("valid address"), 443, 7);
+		let SocketAddr::V6(addr) = addr else {
+			panic!("expected IPv6")
+		};
+		assert_eq!(addr.scope_id(), 7);
 	}
 
 	/// One mesh session carries both directions: a broadcast published on
@@ -674,14 +813,16 @@ mod tests {
 		// The dial side, seeded with what discovery would have advertised.
 		let peer = Peer {
 			id: "peer".to_string(),
-			addrs: vec!["127.0.0.1".parse().expect("valid address")],
-			port,
+			addrs: vec![format!("127.0.0.1:{port}").parse().expect("valid address")],
 			fingerprint,
 			token: "join-token".to_string(),
 		};
 		let a_origin = origin_a.clone();
 		tokio::spawn(async move {
-			dial_session(&a_origin, &moq_net::Versions::all(), &peer).await.ok();
+			Dialer::new(a_origin, moq_net::Versions::all())
+				.connect(&peer)
+				.await
+				.ok();
 		});
 
 		let mut announced_on_b = origin_b.consume().announced();
@@ -732,18 +873,15 @@ mod tests {
 		let origin = moq_net::Origin::random().produce();
 		let peer = Peer {
 			id: "peer".to_string(),
-			addrs: vec!["127.0.0.1".parse().expect("valid address")],
-			port,
+			addrs: vec![format!("127.0.0.1:{port}").parse().expect("valid address")],
 			fingerprint,
 			token: "join-token".to_string(),
 		};
 
-		let result = tokio::time::timeout(
-			TIMEOUT,
-			dial_addr(&origin, &moq_net::Versions::from(vec![lite03]), &peer, peer.addrs[0]),
-		)
-		.await
-		.expect("dial timed out");
+		let dialer = Dialer::new(origin, moq_net::Versions::from(vec![lite03]));
+		let result = tokio::time::timeout(TIMEOUT, dialer.connect_addr(&peer, peer.addrs[0]))
+			.await
+			.expect("dial timed out");
 		assert!(result.is_err(), "a version the listener excludes must not connect");
 	}
 
@@ -776,13 +914,15 @@ mod tests {
 		let origin_a = moq_net::Origin::random().produce();
 		let peer = Peer {
 			id: "peer".to_string(),
-			addrs: vec!["127.0.0.1".parse().expect("valid address")],
-			port,
+			addrs: vec![format!("127.0.0.1:{port}").parse().expect("valid address")],
 			fingerprint,
 			token: "guessed-wrong".to_string(),
 		};
 		tokio::spawn(async move {
-			dial_session(&origin_a, &moq_net::Versions::all(), &peer).await.ok();
+			Dialer::new(origin_a, moq_net::Versions::all())
+				.connect(&peer)
+				.await
+				.ok();
 		});
 
 		let verdict = tokio::time::timeout(TIMEOUT, verdict_rx)
@@ -798,7 +938,7 @@ mod tests {
 	/// The full path: two meshes find each other over real mDNS and converge
 	/// on each other's broadcasts. Ignored because it multicasts on the host
 	/// network, which CI runners may block; run it by hand when touching
-	/// discovery: `cargo test -p moq-native --features local -- --ignored`.
+	/// discovery: `just rs test -p moq-native --features local --run-ignored ignored-only`.
 	#[tokio::test]
 	#[ignore = "needs multicast on the host network; run manually"]
 	async fn mesh_discovers_and_connects() {
@@ -838,8 +978,9 @@ mod tests {
 			.create_broadcast("from-a", moq_net::broadcast::Route::new().with_announce(true))
 			.expect("failed to create broadcast");
 
-		tokio::spawn(Mesh::new(origin_a.clone()).with_secret("swordfish").run());
-		tokio::spawn(Mesh::new(origin_b.clone()).with_secret("swordfish").run());
+		let secret = Secret::new("swordfish").expect("valid secret");
+		tokio::spawn(Mesh::new(origin_a.clone()).with_secret(secret.clone()).run());
+		tokio::spawn(Mesh::new(origin_b.clone()).with_secret(secret).run());
 
 		let mut announced_on_b = origin_b.consume().announced();
 		let update = tokio::time::timeout(TIMEOUT, announced_on_b.next())

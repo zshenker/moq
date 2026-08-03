@@ -20,7 +20,7 @@ path = "src/main.rs"
 [features]
 default = ["iroh", "local", "quinn", "websocket", "nvenc", "vaapi", "nvdec", "pipewire"]
 iroh = ["moq-native/iroh"]
-# Local-network discovery and meshing (`--discover`).
+# Local-network discovery and meshing (`--client-discover`).
 local = ["moq-native/local"]
 jemalloc = ["moq-native/jemalloc"]
 noq = ["moq-native/noq"]
@@ -70,6 +70,7 @@ moq-native = { workspace = true, default-features = false, features = ["aws-lc-r
 moq-rtc = { workspace = true }
 moq-rtmp = { workspace = true }
 moq-srt = { workspace = true }
+moq-token-cli = { workspace = true }
 moq-transcode = { workspace = true, optional = true }
 moq-video = { workspace = true, optional = true }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
