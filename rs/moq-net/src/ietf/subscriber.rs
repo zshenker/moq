@@ -77,6 +77,65 @@ struct BroadcastState {
 	count: usize,
 }
 
+/// The announcements one SUBSCRIBE_NAMESPACE stream owns, withdrawn as a set when
+/// that stream ends however it ends.
+///
+/// Load-bearing: a path is otherwise withdrawn only by an explicit NAMESPACE_DONE,
+/// so EOF, a stream reset, a decode error, or the reading task being dropped would
+/// each leave the broadcast announced -- its `SourceGuard` is held in the SESSION's
+/// broadcast table, not the stream's, so it survives until the whole session drops.
+/// The peer has stopped tracking that namespace by then, so nothing will ever send
+/// the NAMESPACE_DONE that would clear it.
+///
+/// Announcements are COUNTED rather than a set, because the shared table refcounts
+/// them: a peer may announce one path more than once, and each announce has to be
+/// undone exactly once. Withdrawing only what THIS stream announced is also what
+/// keeps two streams with overlapping prefixes from cancelling each other's
+/// announcement of a shared path.
+struct StreamAnnounces<S: web_transport_trait::Session> {
+	subscriber: Subscriber<S>,
+	counts: HashMap<PathOwned, usize>,
+}
+
+impl<S: web_transport_trait::Session> StreamAnnounces<S> {
+	fn new(subscriber: Subscriber<S>) -> Self {
+		Self {
+			subscriber,
+			counts: HashMap::new(),
+		}
+	}
+
+	fn start(&mut self, path: PathOwned) -> Result<(), Error> {
+		self.subscriber.start_announce(path.clone())?;
+		*self.counts.entry(path).or_insert(0) += 1;
+		Ok(())
+	}
+
+	/// Withdraw one announcement, ignoring a path this stream never announced (a
+	/// NAMESPACE_DONE for someone else's path must not decrement their refcount).
+	fn stop(&mut self, path: PathOwned) {
+		let Entry::Occupied(mut entry) = self.counts.entry(path.clone()) else {
+			return;
+		};
+		*entry.get_mut() -= 1;
+		if *entry.get() == 0 {
+			entry.remove();
+		}
+		let _ = self.subscriber.stop_announce(path, true);
+	}
+}
+
+impl<S: web_transport_trait::Session> Drop for StreamAnnounces<S> {
+	fn drop(&mut self) {
+		for (path, count) in std::mem::take(&mut self.counts) {
+			for _ in 0..count {
+				// Not a deliberate unannounce by the peer, so don't count the bytes.
+				let _ = self.subscriber.stop_announce(path.clone(), false);
+			}
+		}
+	}
+}
+
 #[derive(Clone)]
 pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	session: S,
@@ -163,6 +222,8 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	) -> Result<(), Error> {
 		let prefix = self.origin.root().to_owned();
 		let request_id = self.control.next_request_id().await?;
+		// Owns everything this stream announces, so every exit below withdraws it.
+		let mut announces = StreamAnnounces::new(self.clone());
 
 		// Draft-18+ uses SUBSCRIBE_NAMESPACE (0x50); earlier drafts use the legacy
 		// 0x11 message with a Subscribe Options field.
@@ -229,13 +290,13 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					let msg = ietf::Namespace::decode_msg(&mut data, self.version)?;
 					let path = prefix.join(&msg.suffix);
 					tracing::debug!(%path, "namespace");
-					self.start_announce(path)?;
+					announces.start(path)?;
 				}
 				ietf::NamespaceDone::ID => {
 					let msg = ietf::NamespaceDone::decode_msg(&mut data, self.version)?;
 					let path = prefix.join(&msg.suffix);
 					tracing::debug!(%path, "namespace_done");
-					let _ = self.stop_announce(path, true);
+					announces.stop(path);
 				}
 				_ => {
 					tracing::warn!(type_id, "unexpected message on subscribe_namespace stream");
@@ -1062,5 +1123,97 @@ mod tests {
 		let broadcast = consumer.get_broadcast("room/host").unwrap();
 		let hops: Vec<_> = broadcast.routes()[0].hops.iter().copied().collect();
 		assert_eq!(hops, vec![assigned]);
+	}
+
+	fn test_subscriber() -> (
+		Subscriber<crate::lite::test_transport::SinkSession>,
+		crate::origin::Consumer,
+		crate::util::TaskSet,
+	) {
+		let session = crate::lite::test_transport::SinkSession::new(Default::default());
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let consumer = origin.consume();
+		let (tasks, task_set) = crate::util::TaskSet::new();
+		let subscriber = Subscriber::new(
+			session,
+			origin,
+			Control::new(None, false),
+			None,
+			Version::Draft14,
+			tasks,
+		);
+		(subscriber, consumer, task_set)
+	}
+
+	/// A namespace stream that ends WITHOUT a NAMESPACE_DONE (EOF, a reset, a decode
+	/// error) must still withdraw what it announced. The broadcast table belongs to
+	/// the session, not the stream, so without this the announce outlives the stream
+	/// that learned it and nothing is left to ever clear it.
+	#[tokio::test]
+	async fn ending_a_namespace_stream_withdraws_its_announces() {
+		let (subscriber, consumer, _task_set) = test_subscriber();
+
+		{
+			let mut announces = StreamAnnounces::new(subscriber.clone());
+			announces.start(crate::Path::new("room/host").to_owned()).unwrap();
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+			assert!(consumer.get_broadcast("room/host").is_some());
+		} // the stream ends here, however it ended
+
+		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		assert!(
+			consumer.get_broadcast("room/host").is_none(),
+			"a broadcast announced by a stream that died is still routable",
+		);
+	}
+
+	/// Two streams with overlapping prefixes can announce the same path. One ending
+	/// must not withdraw the other's announcement, and the broadcast survives until
+	/// BOTH are gone -- the shared table refcounts, so withdrawing per-stream has to
+	/// withdraw exactly what that stream contributed.
+	#[tokio::test]
+	async fn one_stream_ending_keeps_a_path_another_stream_still_announces() {
+		let (subscriber, consumer, _task_set) = test_subscriber();
+		let path = crate::Path::new("room/host").to_owned();
+
+		let mut long_lived = StreamAnnounces::new(subscriber.clone());
+		long_lived.start(path.clone()).unwrap();
+
+		{
+			let mut short_lived = StreamAnnounces::new(subscriber.clone());
+			short_lived.start(path.clone()).unwrap();
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		assert!(
+			consumer.get_broadcast("room/host").is_some(),
+			"one stream ending withdrew a path another stream still announces",
+		);
+
+		drop(long_lived);
+		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		assert!(consumer.get_broadcast("room/host").is_none());
+	}
+
+	/// A NAMESPACE_DONE for a path this stream never announced is ignored rather
+	/// than decrementing the shared refcount, which would otherwise let one stream
+	/// unannounce a path that belongs to another.
+	#[tokio::test]
+	async fn a_done_for_an_unannounced_path_leaves_other_streams_alone() {
+		let (subscriber, consumer, _task_set) = test_subscriber();
+		let path = crate::Path::new("room/host").to_owned();
+
+		let mut owner = StreamAnnounces::new(subscriber.clone());
+		owner.start(path.clone()).unwrap();
+
+		let mut stranger = StreamAnnounces::new(subscriber.clone());
+		stranger.stop(path.clone());
+
+		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		assert!(
+			consumer.get_broadcast("room/host").is_some(),
+			"a stray NAMESPACE_DONE unannounced another stream's broadcast",
+		);
 	}
 }
