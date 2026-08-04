@@ -1,5 +1,6 @@
 import { Effect, type Getter, Signal } from "@moq/signals";
 import * as Announce from "../announced.ts";
+import { CloseCode, RemoteError } from "../error.ts";
 import type * as Path from "../path.ts";
 import { empty as emptyPath } from "../path.ts";
 import { type ConnectProps, connect, type WebSocketOptions, type WebTransportProps } from "./connect.ts";
@@ -80,7 +81,10 @@ export class Reload {
 	/** The reactive effect scope driving the connect loop; closed by {@link Reload.close}. */
 	#signals = new Effect();
 
-	/** Resolves when the reconnect loop stops via {@link Reload.close} or the retry timeout. */
+	/**
+	 * Resolves when the reconnect loop stops via {@link Reload.close}; rejects when it gives
+	 * up (the retry timeout expired, or the server rejected the session as unauthorized).
+	 */
 	closed: Promise<void>;
 	#closedResolve!: () => void;
 	#closedReject!: (err: Error) => void;
@@ -173,12 +177,14 @@ export class Reload {
 				connected = performance.now();
 
 				// A cancelled effect resolves undefined, so the sentinel tells the session
-				// closing apart from this run being torn down.
-				const closed = await Promise.race([effect.cancel, connection.closed.then(() => true)]);
-				if (!closed) return;
+				// closing (null for clean, an Error otherwise) apart from this run being
+				// torn down.
+				const closed = await Promise.race([effect.cancel, connection.closed]);
+				if (closed === undefined) return;
 
-				console.warn("connection closed, reconnecting");
-				this.#retry(effect, connected);
+				// #retry logs the outcome: a retry after backoff, or giving up.
+				console.warn("connection closed");
+				this.#retry(effect, connected, closed ?? undefined);
 			} catch (err) {
 				// Treat teardown as cancellation, not a connection failure.
 				if (signal.aborted) return;
@@ -191,14 +197,23 @@ export class Reload {
 
 	/**
 	 * Schedule the next connect attempt after the current backoff, or give up when the
-	 * retry window has expired. `connected` is when the dead session was established, if
-	 * it ever was, and `cause` the error that killed it, if it died with one.
+	 * failure is terminal or the retry window has expired. `connected` is when the dead
+	 * session was established, if it ever was, and `cause` the error that killed it, if
+	 * it died with one.
 	 */
 	#retry(effect: Effect, connected: DOMHighResTimeStamp | undefined, cause?: unknown): void {
 		// Any session is dead now: report disconnected during the backoff rather than
 		// when the retry reruns the effect.
 		this.established.set(undefined);
 		this.status.set("disconnected");
+
+		// An auth rejection is terminal however it arrived (a connect failure or a
+		// session close): redialing with the same credentials cannot succeed.
+		if (cause instanceof RemoteError && cause.code === CloseCode.Unauthorized) {
+			console.warn("connection unauthorized, giving up");
+			this.#closedReject(cause);
+			return;
+		}
 
 		// A session that outlived the initial delay was healthy, so clear the backoff and
 		// start a fresh retry window: a one-off drop should reconnect promptly. Anything
@@ -224,6 +239,7 @@ export class Reload {
 			}
 		}
 
+		console.warn(`reconnecting in ${this.#delay}ms`);
 		const tick = this.#tick.peek() + 1;
 		effect.timer(() => this.#tick.update((prev) => Math.max(prev, tick)), this.#delay);
 

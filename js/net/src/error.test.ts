@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { StreamError } from "@moq/qmux";
-import { fromTransport, RemoteError, reason } from "./error.ts";
+import { CloseCode, fromClose, fromTransport, RemoteError, reason } from "./error.ts";
 
 // Minimal stand-in for the DOM WebTransportError, which the test runtime may not define.
 class FakeWebTransportError extends Error {
@@ -95,6 +95,33 @@ test("reason: WebTransportError keeps a populated message and appends details", 
 
 test("reason: a decoded remote error names its code", () => {
 	expect(reason(new RemoteError(31))).toBe("remote error: 31");
+});
+
+test("fromClose: a clean close is null, a coded close keeps its code and reason", () => {
+	expect(fromClose({ closeCode: 0, reason: "" })).toBeNull();
+	// A missing code is what a transport reports for a close with no code of its own.
+	expect(fromClose({})).toBeNull();
+
+	const err = fromClose({ closeCode: CloseCode.Unauthorized, reason: "unauthorized" });
+	expect(err).toBeInstanceOf(RemoteError);
+	expect(err?.code).toBe(6);
+	expect(err?.message).toBe("remote error: 6 (unauthorized)");
+
+	expect(fromClose({ closeCode: 33 })?.message).toBe("remote error: 33");
+});
+
+// The wire codes are a stable contract with every other implementation, pinned by
+// rs/moq-net's to_code_is_stable test. Pin the same load-bearing ones here so a rename
+// can't silently shift them.
+test("CloseCode matches the Rust to_code table", () => {
+	expect(CloseCode.Cancel).toBe(0);
+	expect(CloseCode.Unauthorized).toBe(6);
+	expect(CloseCode.Version).toBe(9);
+	expect(CloseCode.UnknownAlpn).toBe(21);
+	expect(CloseCode.Lagged).toBe(26);
+	expect(CloseCode.Evicted).toBe(31);
+	expect(CloseCode.GoingAway).toBe(32);
+	expect(CloseCode.GoawayTimeout).toBe(33);
 });
 
 test("fromTransport: decodes a real qmux stream reset", () => {

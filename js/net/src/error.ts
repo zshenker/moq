@@ -1,17 +1,89 @@
 /**
- * Errors, including the code a peer reports when it resets a stream.
+ * Errors, including the code a peer reports when it resets a stream or closes the session.
  *
  * @module
  */
 
 /**
- * An error the peer reported by resetting a stream, carrying the raw code it sent.
+ * Session close codes assigned by MoQ, mirroring the Rust `moq_net::Error::to_code` table
+ * (a wire contract shared by every implementation). A {@link RemoteError.code} below 64 came
+ * from this table; codes 64 and up are application-chosen (the application's own code plus 64).
  *
- * The codes are not standardized, so this deliberately does not translate one into a local
- * error: the number means whatever the peer's implementation says it means. A read or write
- * rejects with this on every transport, so branch on {@link code} rather than feature-detecting
- * `WebTransportError`, which a non-browser runtime never defines and the WebSocket fallback
- * never throws.
+ * @public
+ */
+export const CloseCode = {
+	/** The peer is done, not failing: a clean close or a routine unsubscribe. */
+	Cancel: 0,
+	/** A required extension was not present. */
+	RequiredExtension: 1,
+	/** The group is older than the latest group and was dropped. */
+	Old: 2,
+	/** It took too long to open or transmit a stream. */
+	Timeout: 3,
+	/** The peer's underlying transport failed. */
+	Transport: 4,
+	/** The peer could not parse a message. */
+	Decode: 5,
+	/** The peer rejected the credentials or the requested path. Terminal: retrying with the same credentials fails again. */
+	Unauthorized: 6,
+	/** Version negotiation failed. */
+	Version: 9,
+	/** An unexpected stream type was received. */
+	UnexpectedStream: 10,
+	/** An integer exceeded the QUIC varint range. */
+	BoundsExceeded: 11,
+	/** A duplicate ID was used. */
+	Duplicate: 12,
+	/** The requested broadcast or track does not exist at the peer. */
+	NotFound: 13,
+	/** A frame's payload length disagreed with its declared size. */
+	WrongSize: 14,
+	/** A protocol rule was broken; the session is unusable. */
+	ProtocolViolation: 15,
+	/** A valid message arrived in a state where it is not allowed. */
+	UnexpectedMessage: 16,
+	/** The peer was asked for a feature it does not implement. */
+	Unsupported: 17,
+	/** The peer could not serialize a message for the negotiated version. */
+	Encode: 18,
+	/** A message carried more parameters than the peer accepts. */
+	TooManyParameters: 19,
+	/** The peer acted against the role it advertised at SETUP. */
+	InvalidRole: 20,
+	/** An unrecognized ALPN, so no version could be negotiated. */
+	UnknownAlpn: 21,
+	/** The producer was dropped without finishing, so the content is incomplete. */
+	Dropped: 24,
+	/** The handle was already closed. */
+	Closed: 25,
+	/** The reader fell behind the group's byte budget and a frame was dropped. */
+	Lagged: 26,
+	/** A frame declared a payload size larger than the receiver accepts. */
+	FrameTooLarge: 27,
+	/** A frame's timestamp doesn't match its track's negotiated timescale. */
+	TimestampMismatch: 29,
+	/** A broadcast was requested that nothing announces or serves. */
+	Unroutable: 30,
+	/** The group was evicted under memory pressure; it can be re-fetched. */
+	Evicted: 31,
+	/** The session is going away (a GOAWAY was received). */
+	GoingAway: 32,
+	/** The peer did not close within the GOAWAY drain deadline. */
+	GoawayTimeout: 33,
+} as const;
+
+/** A wire close code from the reserved table. See {@link CloseCode}. */
+export type CloseCode = (typeof CloseCode)[keyof typeof CloseCode];
+
+/**
+ * An error the peer reported by resetting a stream or closing the session, carrying the raw
+ * code it sent.
+ *
+ * This deliberately does not translate the code into a local error: the number means whatever
+ * the peer says it means ({@link CloseCode} names the reserved range; 64 and up are
+ * application-chosen). A read or write rejects with this on every transport, so branch on
+ * {@link code} rather than feature-detecting `WebTransportError`, which a non-browser runtime
+ * never defines and the WebSocket fallback never throws.
  *
  * Code 0 is what a transport sends when a stream is dropped or aborted with no code of its own.
  *
@@ -19,8 +91,7 @@
  * try {
  *   frame = await group.readFrame();
  * } catch (err) {
- *   // Whatever this peer's code 2 means to it.
- *   if (err instanceof RemoteError && err.code === 2) return;
+ *   if (err instanceof RemoteError && err.code === CloseCode.Old) return;
  *   throw err;
  * }
  * ```
@@ -31,8 +102,8 @@ export class RemoteError extends Error {
 	/** The code the peer sent, verbatim. */
 	readonly code: number;
 
-	constructor(code: number, options?: { cause?: unknown }) {
-		super(`remote error: ${code}`, options);
+	constructor(code: number, options?: { cause?: unknown; reason?: string }) {
+		super(options?.reason ? `remote error: ${code} (${options.reason})` : `remote error: ${code}`, options);
 		this.name = "RemoteError";
 		this.code = code;
 	}
@@ -64,6 +135,19 @@ export function fromTransport(err: unknown): Error {
 	const code = streamCode(err);
 	if (code === undefined) return error(err);
 	return new RemoteError(code, { cause: err });
+}
+
+/**
+ * Decode a session close into its terminal error: `null` for a clean close (code 0), otherwise
+ * a {@link RemoteError} carrying the code the peer chose (e.g. {@link CloseCode.Unauthorized}
+ * for an auth rejection).
+ *
+ * @internal Applied to the transport's `closed` info so the code survives to the application.
+ */
+export function fromClose(info: WebTransportCloseInfo): RemoteError | null {
+	const code = info.closeCode ?? 0;
+	if (code === CloseCode.Cancel) return null;
+	return new RemoteError(code, { reason: info.reason });
 }
 
 /**

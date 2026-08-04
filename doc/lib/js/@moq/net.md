@@ -77,7 +77,18 @@ try {
 }
 ```
 
-The code arrives the same way whether the session negotiated WebTransport or the WebSocket fallback, so nothing has to feature-detect `WebTransportError`. The codes themselves are not standardized: each number means whatever the peer's implementation decided, so `@moq/net` hands it over without interpreting it. Code 0 is the exception worth knowing, since that is what a transport sends for a stream dropped or aborted with no code of its own.
+The code arrives the same way whether the session negotiated WebTransport or the WebSocket fallback, so nothing has to feature-detect `WebTransportError`. `@moq/net` hands the number over without translating it: codes below 64 come from the reserved MoQ table (`Moq.CloseCode` names them, matching the Rust implementation), while 64 and up are application-chosen. Code 0 is worth knowing either way, since that is what a transport sends for a stream dropped or aborted with no code of its own.
+
+A session close carries a code too. `connection.closed` resolves with `null` for a clean close, or a `Moq.RemoteError` when the peer closed with one:
+
+```ts
+const err = await connection.closed;
+if (err instanceof Moq.RemoteError && err.code === Moq.CloseCode.Unauthorized) {
+	console.warn("server rejected the session:", err.message);
+}
+```
+
+An unauthorized close is terminal for `Moq.Connection.Reload`: it stops retrying and rejects its `closed` promise instead of backing off with the same credentials.
 
 Errors this side detects keep their own messages, like the `Group.Lagged` a read throws after frames were evicted before it got to them.
 
