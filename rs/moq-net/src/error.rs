@@ -193,8 +193,56 @@ impl Error {
 		}
 	}
 
-	/// Convert a transport error into an [Error], decoding stream reset codes.
+	/// The inverse of [`Self::to_code`]: decode a close code received off the wire.
+	///
+	/// Codes whose variants carry a payload we can't reconstruct (e.g.
+	/// [`Self::Transport`], [`Self::Decode`]), and codes this version doesn't know,
+	/// decode to [`Self::Remote`]. Codes past the reserved range decode to
+	/// [`Self::App`].
+	pub fn from_code(code: u32) -> Self {
+		match code {
+			0 => Self::Cancel,
+			1 => Self::RequiredExtension,
+			2 => Self::Old,
+			3 => Self::Timeout,
+			6 => Self::Unauthorized,
+			9 => Self::Version,
+			10 => Self::UnexpectedStream,
+			12 => Self::Duplicate,
+			13 => Self::NotFound,
+			14 => Self::WrongSize,
+			15 => Self::ProtocolViolation,
+			16 => Self::UnexpectedMessage,
+			17 => Self::Unsupported,
+			19 => Self::TooManyParameters,
+			20 => Self::InvalidRole,
+			24 => Self::Dropped,
+			25 => Self::Closed,
+			26 => Self::Lagged,
+			27 => Self::FrameTooLarge,
+			29 => Self::TimestampMismatch,
+			30 => Self::Unroutable,
+			31 => Self::Evicted,
+			32 => Self::GoingAway,
+			33 => Self::GoawayTimeout,
+			code @ 64.. => match u16::try_from(code - 64) {
+				Ok(app) => Self::App(app),
+				Err(_) => Self::Remote(code),
+			},
+			code => Self::Remote(code),
+		}
+	}
+
+	/// Convert a transport error into an [Error], decoding session close and stream
+	/// reset codes.
 	pub fn from_transport(err: impl web_transport_trait::Error) -> Self {
+		// A session close carries the code the peer chose, so decode it back into
+		// the variant it encodes (e.g. an auth rejection surfaces as
+		// [`Self::Unauthorized`]) instead of an unclassifiable transport string.
+		if let Some((code, _reason)) = err.session_error() {
+			return Self::from_code(code);
+		}
+
 		match err.stream_error() {
 			// Code 0 is what [`Self::Cancel`] encodes to, and what a plain stream
 			// drop sends: the peer is done with the stream, not failing. Decoding it
@@ -236,5 +284,57 @@ mod tests {
 		assert_eq!(Error::App(0).to_code(), 64);
 		assert_eq!(Error::App(404).to_code(), 468);
 		assert_eq!(Error::Remote(468).to_code(), 468);
+	}
+
+	// Every payload-less variant must survive the wire round trip: a session close
+	// is classified by decoding its code, so a variant that doesn't come back is a
+	// rejection the client can no longer tell apart from a network blip.
+	#[test]
+	fn from_code_inverts_to_code() {
+		let variants = [
+			Error::Cancel,
+			Error::RequiredExtension,
+			Error::Old,
+			Error::Timeout,
+			Error::Unauthorized,
+			Error::Version,
+			Error::UnexpectedStream,
+			Error::Duplicate,
+			Error::NotFound,
+			Error::WrongSize,
+			Error::ProtocolViolation,
+			Error::UnexpectedMessage,
+			Error::Unsupported,
+			Error::TooManyParameters,
+			Error::InvalidRole,
+			Error::Dropped,
+			Error::Closed,
+			Error::Lagged,
+			Error::FrameTooLarge,
+			Error::TimestampMismatch,
+			Error::Unroutable,
+			Error::Evicted,
+			Error::GoingAway,
+			Error::GoawayTimeout,
+			Error::App(0),
+			Error::App(404),
+			Error::App(u16::MAX),
+		];
+		for err in variants {
+			let decoded = Error::from_code(err.to_code());
+			assert_eq!(decoded.to_code(), err.to_code());
+			assert_eq!(
+				std::mem::discriminant(&decoded),
+				std::mem::discriminant(&err),
+				"{err:?} did not round trip"
+			);
+		}
+
+		// Payload variants and unknown codes can't be reconstructed: they stay Remote.
+		assert!(matches!(Error::from_code(4), Error::Remote(4)));
+		assert!(matches!(Error::from_code(5), Error::Remote(5)));
+		assert!(matches!(Error::from_code(28), Error::Remote(28)));
+		// An app code past the u16 range is out of spec; keep the raw code.
+		assert!(matches!(Error::from_code(65_536 + 64), Error::Remote(_)));
 	}
 }

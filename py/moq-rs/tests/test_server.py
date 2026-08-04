@@ -134,14 +134,12 @@ async def test_server_request_close():
             client = moq_ffi.MoqClient()
             client.set_tls_disable_verify(True)
             client.set_bind("127.0.0.1:0")
-            # One-shot: a MoQ-layer rejection reaches the client as an untyped
-            # transport close, which the default reconnect would retry with
-            # backoff instead of surfacing here.
-            client.set_reconnect(False)
-            # The rejection races the optimistic connect: it surfaces either as a
-            # connect error or as the session's terminal close. MoqError is an
-            # Exception subclass at runtime; UniFFI's generated code rebinds the
-            # name so the static checker doesn't see it.
+            # The rejection decodes to a typed auth error, terminal even for the
+            # default reconnect loop, and races the optimistic connect: it
+            # surfaces either as a connect error or as the session's terminal
+            # close. MoqError is an Exception subclass at runtime; UniFFI's
+            # generated code rebinds the name so the static checker doesn't
+            # see it.
             try:
                 session = await asyncio.wait_for(client.connect(f"https://{server.local_addr}"), timeout=5.0)
             except moq_ffi.MoqError:  # type: ignore[misc]

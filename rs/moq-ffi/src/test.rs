@@ -1627,10 +1627,11 @@ async fn one_shot_client_close_surfaces_through_closed() {
 	server.cancel();
 }
 
-/// A rejection at the MoQ layer reaches the client as an untyped transport
-/// close, which the reconnect loop retries like any other drop. One-shot mode
-/// is how a caller observes the rejection directly; mirrors py
-/// test_server_request_close, which drives the same path through the bindings.
+/// A rejection at the MoQ layer rides the session close code, which the client
+/// decodes back into a typed auth error: even with reconnecting enabled (the
+/// default), the loop stops on it immediately instead of retrying with backoff
+/// until the give-up timeout. Mirrors py test_server_request_close, which
+/// drives the same path through the bindings.
 #[tokio::test]
 async fn rejected_session_surfaces_through_closed() {
 	let server = MoqServer::new();
@@ -1656,7 +1657,6 @@ async fn rejected_session_surfaces_through_closed() {
 	let client = MoqClient::new();
 	client.set_tls_disable_verify(true);
 	client.set_bind("127.0.0.1:0".into()).unwrap();
-	client.set_reconnect(false);
 
 	// Either the dial fails outright, or the optimistic connect resolves and the
 	// rejection lands as the session's terminal close. Both must surface within

@@ -463,6 +463,17 @@ impl Connection {
 						};
 					}
 
+					// An auth rejection is terminal however long the session lived
+					// (e.g. Request::close after the transport was accepted, or a
+					// token expiring mid-session): redialing with the same
+					// credentials cannot succeed.
+					if let Ended::Closed(Err(err)) = &ended {
+						let err = Error::from(err.clone());
+						if err.is_auth() {
+							return Err(err);
+						}
+					}
+
 					if healthy {
 						// Reset the backoff window so a one-off drop reconnects promptly.
 						tracing::warn!(%url, "session closed, reconnecting");
@@ -482,12 +493,6 @@ impl Connection {
 							// Handled above: a GOAWAY never reaches here.
 							Ended::Goaway(_) => None,
 						};
-						// NOTE: a rejection at the MoQ layer (Request::close after the
-						// transport is accepted) lands here as an untyped transport close,
-						// so it cannot be told apart from a network blip and is retried
-						// with backoff until the give-up timeout. Classifying it needs the
-						// transport to surface the close code; until then, one-shot mode
-						// (`reconnect = false`) is how a caller observes rejections directly.
 						match err {
 							Some(err) => {
 								tracing::warn!(%url, %err, "session severed immediately, retrying");
@@ -610,9 +615,9 @@ impl Connection {
 
 	/// Poll whether the connection loop has stopped.
 	///
-	/// `Ready(Err)` if it permanently gave up (reconnect timeout exceeded, or the session
-	/// ended in one-shot mode), `Ready(Ok(()))` if stopped by dropping the handle,
-	/// `Pending` while it's still running.
+	/// `Ready(Err)` if it permanently gave up (reconnect timeout exceeded, an auth
+	/// rejection, or the session ended in one-shot mode), `Ready(Ok(()))` if stopped
+	/// by dropping the handle, `Pending` while it's still running.
 	pub fn poll_closed(&self, waiter: &kio::Waiter) -> Poll<crate::Result<()>> {
 		ready!(self.state.poll_closed(waiter));
 		Poll::Ready(match &self.state.read().error {
