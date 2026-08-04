@@ -72,6 +72,55 @@ async def test_server_client_roundtrip():
             broadcast.finish()
 
 
+async def test_client_reconnects_and_resumes_announcements():
+    """#2609: the client rides out a transport drop on its own. A broadcast
+    published only after the server kills the first session still reaches the
+    client's announcements; the old one-shot session stalled silently forever."""
+    async with moq.Server("127.0.0.1:0", tls_generate=["localhost"]) as server:
+        sessions: list = []
+        accepted = asyncio.Event()
+
+        async def accept_loop() -> None:
+            async for request in server:
+                sessions.append(await request.accept())
+                accepted.set()
+
+        accept_task = asyncio.create_task(accept_loop())
+
+        try:
+            async with moq.Client(
+                f"https://{server.local_addr}",
+                tls_verify=False,
+                bind="127.0.0.1:0",
+                # Fast retries so the test doesn't wait out the default 1s backoff.
+                backoff=moq.Backoff(initial_ms=50, multiplier=2, max_ms=200, timeout_ms=0),
+            ) as client:
+                session = client.session
+                assert session is not None
+                assert await session.status() == moq.ConnectionStatus.CONNECTED
+
+                # Kill the transport under the client, like a relay restart.
+                await asyncio.wait_for(accepted.wait(), timeout=10)
+                sessions[0].cancel(0)
+
+                # The client redials on its own; the accept loop serves it.
+                while await asyncio.wait_for(session.status(), timeout=10) != moq.ConnectionStatus.CONNECTED:
+                    pass
+
+                # A broadcast published only after the reconnect still arrives.
+                broadcast = server.create_broadcast("after-reconnect")
+                async for announcement in client.announced():
+                    assert announcement.path == "after-reconnect"
+                    break
+                broadcast.finish()
+        finally:
+            accept_task.cancel()
+            try:
+                await accept_task
+            except asyncio.CancelledError:
+                pass
+
+
 async def test_server_request_close():
     """A session reports when the server rejects its request."""
     async with moq.Server("127.0.0.1:0", tls_generate=["localhost"]) as server:
@@ -85,11 +134,21 @@ async def test_server_request_close():
             client = moq_ffi.MoqClient()
             client.set_tls_disable_verify(True)
             client.set_bind("127.0.0.1:0")
-            # MoqError is an Exception subclass at runtime; UniFFI's generated
-            # code rebinds the name so the static checker doesn't see it.
-            session = await asyncio.wait_for(client.connect(f"https://{server.local_addr}"), timeout=5.0)
-            with pytest.raises(moq_ffi.MoqError):  # type: ignore[arg-type]
-                await asyncio.wait_for(session.closed(), timeout=5.0)
+            # One-shot: a MoQ-layer rejection reaches the client as an untyped
+            # transport close, which the default reconnect would retry with
+            # backoff instead of surfacing here.
+            client.set_reconnect(False)
+            # The rejection races the optimistic connect: it surfaces either as a
+            # connect error or as the session's terminal close. MoqError is an
+            # Exception subclass at runtime; UniFFI's generated code rebinds the
+            # name so the static checker doesn't see it.
+            try:
+                session = await asyncio.wait_for(client.connect(f"https://{server.local_addr}"), timeout=5.0)
+            except moq_ffi.MoqError:  # type: ignore[misc]
+                pass
+            else:
+                with pytest.raises(moq_ffi.MoqError):  # type: ignore[arg-type]
+                    await asyncio.wait_for(session.closed(), timeout=5.0)
         finally:
             reject_task.cancel()
             try:

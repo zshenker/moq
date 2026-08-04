@@ -2621,3 +2621,29 @@ async fn goaway_timeout_force_close_moq_transport_19_quic() {
 		.expect("server task panicked")
 		.expect("server errored");
 }
+
+/// A rejection at the MoQ layer (`Request::close` after the transport is
+/// accepted) reaches the client as an untyped transport close, so the reconnect
+/// loop cannot classify it and retries with backoff. One-shot mode is how a
+/// caller observes the rejection directly: the close is the terminal error.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn one_shot_surfaces_a_session_level_rejection() {
+	let (mut server, addr) = test_server();
+	let url: url::Url = format!("https://localhost:{}", addr.port()).parse().unwrap();
+
+	let server_handle = tokio::spawn(async move {
+		while let Some(request) = server.accept().await {
+			request.close(403).await?;
+		}
+		Ok::<_, anyhow::Error>(())
+	});
+
+	let connection = test_client().with_reconnect(false).connect(url);
+	tokio::time::timeout(TIMEOUT, connection.closed())
+		.await
+		.expect("close timed out")
+		.expect_err("a rejected session must surface as an error");
+
+	server_handle.abort();
+}

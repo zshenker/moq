@@ -282,16 +282,28 @@ impl ConnectionStatsReader {
 /// The extra toggle a plain session doesn't have is the connection lifecycle: [`established`](Self::established)
 /// waits for the first session, [`connected`](Self::connected) reads the current state synchronously,
 /// and [`status`](Self::status) waits for the next change. [`closed`](Self::closed)
-/// waits for the loop to stop. Dropping the handle aborts the background task.
+/// waits for the loop to stop. Clones share the loop; it stops when the last
+/// clone drops (or on an explicit [`close`](Self::close)).
+#[derive(Clone)]
 pub struct Connection {
-	abort: tokio::task::AbortHandle,
+	abort: std::sync::Arc<AbortOnDrop>,
 	state: kio::Consumer<State>,
 	/// Persistent send-bitrate estimate, fed by the loop from each live session.
 	send_bandwidth: BandwidthConsumer,
 	/// Persistent recv-bitrate estimate, fed by the loop from each live session.
 	recv_bandwidth: BandwidthConsumer,
 	/// The last status returned by [`status`](Self::status), for change detection.
+	/// Per-clone: a clone starts from its parent's cursor and diverges from there.
 	last_reported: Option<Status>,
+}
+
+/// Aborts the connection loop when the last [`Connection`] clone drops.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
 }
 
 impl Connection {
@@ -322,12 +334,21 @@ impl Connection {
 			// Dropping the producers here closes the channels, signaling consumers.
 		});
 		Self {
-			abort: task.abort_handle(),
+			abort: std::sync::Arc::new(AbortOnDrop(task.abort_handle())),
 			state,
 			send_bandwidth,
 			recv_bandwidth,
 			last_reported: None,
 		}
+	}
+
+	/// Stop the loop now, for every clone.
+	///
+	/// The current session closes with everything else, and [`closed`](Self::closed)
+	/// returns `Ok` (a local stop, not a failure). Prefer just dropping the last
+	/// clone; this is for teardown paths that can't control which clone drops last.
+	pub fn close(&self) {
+		self.abort.0.abort();
 	}
 
 	async fn run(
@@ -461,6 +482,12 @@ impl Connection {
 							// Handled above: a GOAWAY never reaches here.
 							Ended::Goaway(_) => None,
 						};
+						// NOTE: a rejection at the MoQ layer (Request::close after the
+						// transport is accepted) lands here as an untyped transport close,
+						// so it cannot be told apart from a network blip and is retried
+						// with backoff until the give-up timeout. Classifying it needs the
+						// transport to surface the close code; until then, one-shot mode
+						// (`reconnect = false`) is how a caller observes rejections directly.
 						match err {
 							Some(err) => {
 								tracing::warn!(%url, %err, "session severed immediately, retrying");
@@ -748,12 +775,6 @@ fn poll_forward(bw: &mut Option<BandwidthConsumer>, out: &BandwidthProducer, wai
 				return;
 			}
 		}
-	}
-}
-
-impl Drop for Connection {
-	fn drop(&mut self) {
-		self.abort.abort();
 	}
 }
 
