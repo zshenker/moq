@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/moq-dev/moq/compare/moq-video-v0.0.12...moq-video-v0.0.13) - 2026-08-04
+
+### Added
+
+- *(moq-video)* resize Direct3D11 textures on the GPU ([#2601](https://github.com/moq-dev/moq/pull/2601))
+
 ## [0.0.12](https://github.com/moq-dev/moq/compare/moq-video-v0.0.11...moq-video-v0.0.12) - 2026-08-03
 
 ### Fixed

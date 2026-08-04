@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-net-v0.2.7...moq-net-v0.2.8) - 2026-08-04
+
+### Other
+
+- render gate, Hop ID 0, cluster rename, and a simplification pass ([#2607](https://github.com/moq-dev/moq/pull/2607))
+- Don't warn on Alive::drop if aborted ([#2580](https://github.com/moq-dev/moq/pull/2580))
+
 ## [0.2.7](https://github.com/moq-dev/moq/compare/moq-net-v0.2.6...moq-net-v0.2.7) - 2026-08-03
 
 ### Added
