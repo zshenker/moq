@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792425407465,
+  "lastUpdate": 1792766145963,
   "repoUrl": "https://github.com/zshenker/moq",
   "entries": {
     "MoQ nightly throughput": [
@@ -266,6 +266,273 @@ window.BENCHMARK_DATA = {
           {
             "name": "bench-ffi/python/throughput/size=1024/pub=4/sub=4",
             "value": 21.06545947045962,
+            "unit": "MB/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]",
+            "email": "49699333+dependabot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "8f13d08d18e4b77e23779e0fe0c0edf25f34351d",
+          "message": "chore(deps): Bump the cargo group with 7 updates (#5902)\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-18T15:02:41Z",
+          "url": "https://github.com/zshenker/moq/commit/8f13d08d18e4b77e23779e0fe0c0edf25f34351d"
+        },
+        "date": 1792766145760,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "bench-ffi/rust-net/throughput/size=100/pub=1/sub=1",
+            "value": 326.3785665914688,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-net/throughput/size=1024/pub=1/sub=1",
+            "value": 1778.0354812942767,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-net/throughput/size=65536/pub=1/sub=1",
+            "value": 13598.84554584829,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-net/throughput/size=1048576/pub=1/sub=1",
+            "value": 13372.848785240036,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-net/throughput/size=1024/pub=1/sub=4",
+            "value": 4713.6820655039155,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-net/throughput/size=1024/pub=4/sub=1",
+            "value": 1640.3365286067822,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-net/throughput/size=1024/pub=4/sub=4",
+            "value": 4367.728660974187,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=100/pub=1/sub=1",
+            "value": 69.14429137514144,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=1024/pub=1/sub=1",
+            "value": 578.9530207540324,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=65536/pub=1/sub=1",
+            "value": 7236.506672847397,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=1048576/pub=1/sub=1",
+            "value": 7571.858384890367,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=1024/pub=1/sub=4",
+            "value": 742.6473112477428,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=1024/pub=4/sub=1",
+            "value": 546.8231866792452,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/rust-ffi/throughput/size=1024/pub=4/sub=4",
+            "value": 720.2323636029871,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=100/pub=1/sub=1",
+            "value": 22.5274,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=1024/pub=1/sub=1",
+            "value": 64.2004,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=65536/pub=1/sub=1",
+            "value": 82.5333,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=1048576/pub=1/sub=1",
+            "value": 77.4067,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=1024/pub=1/sub=4",
+            "value": 66.6139,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=1024/pub=4/sub=1",
+            "value": 65.3436,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/cpp/throughput/size=1024/pub=4/sub=4",
+            "value": 66.6651,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=100/pub=1/sub=1",
+            "value": 9.25085692179895,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=1024/pub=1/sub=1",
+            "value": 78.77159376581196,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=65536/pub=1/sub=1",
+            "value": 447.7057369992508,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=1048576/pub=1/sub=1",
+            "value": 320.0142734731727,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=1024/pub=1/sub=4",
+            "value": 110.44716895232466,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=1024/pub=4/sub=1",
+            "value": 90.49088973602532,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/dart/throughput/size=1024/pub=4/sub=4",
+            "value": 114.23857861931931,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=100/pub=1/sub=1",
+            "value": 8.53106799181534,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=1024/pub=1/sub=1",
+            "value": 76.1971732208952,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=1024/pub=1/sub=4",
+            "value": 200.73722854738347,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=1024/pub=4/sub=1",
+            "value": 137.00904965719465,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=1024/pub=4/sub=4",
+            "value": 257.78704846532105,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=1048576/pub=1/sub=1",
+            "value": 455.49416825968297,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/go/throughput/size=65536/pub=1/sub=1",
+            "value": 470.37170915043276,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=100/pub=1/sub=1",
+            "value": 1.3757275000239775,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=1024/pub=1/sub=1",
+            "value": 14.333239350198252,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=65536/pub=1/sub=1",
+            "value": 232.81110188996297,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=1048576/pub=1/sub=1",
+            "value": 466.8144146662369,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=1024/pub=1/sub=4",
+            "value": 27.958255559607736,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=1024/pub=4/sub=1",
+            "value": 18.084167458427505,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/kotlin/throughput/size=1024/pub=4/sub=4",
+            "value": 19.26166555748952,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=100/pub=1/sub=1",
+            "value": 1.192238951590869,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=1024/pub=1/sub=1",
+            "value": 10.942492158198364,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=65536/pub=1/sub=1",
+            "value": 265.652881007988,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=1048576/pub=1/sub=1",
+            "value": 474.35619352653646,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=1024/pub=1/sub=4",
+            "value": 18.163127312002473,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=1024/pub=4/sub=1",
+            "value": 12.95223831980397,
+            "unit": "MB/s"
+          },
+          {
+            "name": "bench-ffi/python/throughput/size=1024/pub=4/sub=4",
+            "value": 20.259373014162467,
             "unit": "MB/s"
           }
         ]
