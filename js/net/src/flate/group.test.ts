@@ -8,6 +8,23 @@ import { stored } from "./group.ts";
 
 const payload = new TextEncoder().encode("one shared compression window ".repeat(100));
 
+test("a compressed frame's retained Object Properties are charged beside its slice", async () => {
+	const config = new Uint8Array(4096);
+	const properties = new Map<bigint, bigint | Uint8Array>([[0x0dn, config]]);
+	const track = new Track("compressed").accept({ compress: true });
+	const plain = track.appendGroup();
+	plain.writeFrame({ payload });
+	const charged = track.appendGroup();
+	charged.writeFrame({ payload, properties });
+	try {
+		expect(hooks.groupCacheBytes(charged)).toBe(hooks.groupCacheBytes(plain) + 8 + config.byteLength);
+		expect((await charged.consume().readFrame())?.properties).toBe(properties);
+	} finally {
+		track.finish();
+		track.close();
+	}
+});
+
 test("synchronous writers store slices; plain readers share one charged inflated copy", async () => {
 	const track = new Track("compressed").accept({ compress: true });
 	const group = track.appendGroup();

@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test";
-import { Cursor, Reader, Writer } from "../stream.ts";
+import { GroupTooLarge } from "../error.ts";
+import { Producer as GroupProducer, MAX_GROUP_CACHE_BYTES } from "../group.ts";
+import { hooks } from "../internal.ts";
+import { Cursor, encodeVarint, Reader, Writer } from "../stream.ts";
 import { Timescale, Timestamp } from "../time.ts";
 import { FetchHeader } from "./fetch.ts";
-import { decodeObjectTime, encodeObjectExtensions, Group } from "./object.ts";
+import { decodeObjectTime, encodeObjectExtensions, Frame, Group } from "./object.ts";
 import { Version } from "./version.ts";
 
 const VERSION = Version.DRAFT_18;
@@ -67,4 +70,53 @@ test("a data stream's header goes out in one write, stream type included", async
 		expect((await FetchHeader.decode(fetch, version)).requestId).toBe(1_000_000n);
 		expect(await fetch.done()).toBe(true);
 	}
+});
+
+// One object of a subgroup stream: Object ID delta 0, its Properties `block`, then `payload`.
+function objectWithProperties(block: Uint8Array, payload: Uint8Array): Uint8Array {
+	const length = encodeVarint(block.byteLength, VERSION);
+	return new Uint8Array([0, ...length, ...block, payload.byteLength, ...payload]);
+}
+
+const OBJECT_FLAGS = {
+	hasExtensions: true,
+	hasSubgroup: false,
+	hasSubgroupObject: false,
+	hasEnd: true,
+	hasPriority: true,
+	firstObject: true,
+};
+
+test("a tiny object with a full block of unknown properties retains and charges only LOC's", () => {
+	// A Timestamp, then about 32K more even ids as two-byte entries, filling the 64 KiB block.
+	const block: number[] = [0x10, 5];
+	while (block.length < 64 * 1024 - 2) block.push(0x02, 0);
+	const payload = new Uint8Array([42]);
+	const frame = Frame.decode(
+		new Cursor(objectWithProperties(new Uint8Array(block), payload), VERSION),
+		OBJECT_FLAGS,
+		undefined,
+	);
+	expect(frame.properties?.size).toBe(1);
+	expect(frame.properties?.get(0x10n)).toBe(5n);
+
+	const group = new GroupProducer(0);
+	group.writeFrame({ payload, properties: frame.properties });
+	// The payload byte plus one id and its varint.
+	expect(hooks.groupCacheBytes(group)).toBe(1 + 16);
+	group.finish();
+});
+
+test("retained property bytes share the group's cache budget with the payload", () => {
+	const config = new Uint8Array(60 * 1024);
+	const properties = new Map<bigint, bigint | Uint8Array>([[0x0dn, config]]);
+	const group = new GroupProducer(0);
+	group.writeFrame({ payload: new Uint8Array([1]), properties });
+	expect(hooks.groupCacheBytes(group)).toBe(1 + 8 + config.byteLength);
+	// One-byte payloads, each pinning 60 KiB of config, still run out of room.
+	expect(() => {
+		for (let i = 0; i < MAX_GROUP_CACHE_BYTES / config.byteLength + 1; i++) {
+			group.writeFrame({ payload: new Uint8Array([1]), properties });
+		}
+	}).toThrow(GroupTooLarge);
 });

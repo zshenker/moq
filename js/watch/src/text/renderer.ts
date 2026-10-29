@@ -1,7 +1,7 @@
 import { Milli } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
-import { Error as NetError } from "@moq/net";
+import { type Group, Error as NetError } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys } from "@moq/signals";
 import type { VTTCue, VTTRegion } from "media-captions";
 import { subscribeMedia } from "../media";
@@ -43,6 +43,19 @@ export type CueStore = {
 	cues: VTTCue[];
 	clears: number[];
 };
+
+/**
+ * Decode each frame of a text `group` in arrival order, with the Object Properties LOC-04 framing needs.
+ *
+ * @internal
+ */
+export async function* textSamples(group: Group.Consumer, format: Container.Format): AsyncGenerator<Container.Frame> {
+	for (;;) {
+		const frame = await group.readFrame();
+		if (!frame) return;
+		yield* format.decode(frame.payload, frame.timestamp, frame.properties);
+	}
+}
 
 /**
  * Neutralize a cue payload before the renderer splices it into `innerHTML`.
@@ -335,12 +348,8 @@ export class Renderer {
 
 					effect.spawn(async () => {
 						try {
-							for (;;) {
-								const frame = await group.readFrame();
-								if (!frame) break;
-								for (const sample of format.decode(frame.payload, frame.timestamp)) {
-									await this.#ingest(config.format, sample, store);
-								}
+							for await (const sample of textSamples(group, format)) {
+								await this.#ingest(config.format, sample, store);
 							}
 						} catch (err) {
 							if (!(err instanceof NetError.Stream)) throw err;

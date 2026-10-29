@@ -62,19 +62,24 @@ export function decodeObjectTime(c: Cursor, timescale: Timescale): Timestamp | u
 }
 
 // The Timestamp in `properties`, in the track's `timescale`.
-function objectTime(properties: ObjectProperties, timescale: Timescale): Timestamp | undefined {
-	const timestamp = properties.get(PROP_TIMESTAMP);
+function objectTime(properties: ObjectProperties | undefined, timescale: Timescale): Timestamp | undefined {
+	const timestamp = properties?.get(PROP_TIMESTAMP);
 	if (typeof timestamp !== "bigint") return undefined;
 	return new Timestamp(Number(timestamp), timescale);
 }
 
+// The Object Properties a receiver keeps: the public ones draft-ietf-moq-loc-04 registers
+// (section 6.1), which a LOC container reads. Every other one is skipped, so a peer cannot make a
+// tiny object hold thousands of entries.
+const RETAINED = new Set([0x08n, 0x09n, 0x0cn, 0x0dn, 0x0fn, PROP_TIMESTAMP]);
+
 /**
- * Decode an object's whole Properties block, by id. A repeated Timestamp is malformed, as Rust
- * refuses it; any other repeated id keeps its first value, since a relay may forward a list
- * whose unknown properties repeat.
+ * Decode an object's Properties block, consuming all of it and keeping only the LOC public
+ * properties, or `undefined` when it holds none. A repeated Timestamp is malformed, as Rust
+ * refuses it; any other repeated id keeps its first value.
  */
-export function decodeObjectProperties(c: Cursor): ObjectProperties {
-	const properties = new Map<bigint, bigint | Uint8Array>();
+export function decodeObjectProperties(c: Cursor): ObjectProperties | undefined {
+	let properties: Map<bigint, bigint | Uint8Array> | undefined;
 	let prevType = 0n;
 	let first = true;
 
@@ -85,6 +90,8 @@ export function decodeObjectProperties(c: Cursor): ObjectProperties {
 		prevType = id;
 
 		const value = id % 2n === 0n ? c.u62() : c.read(c.u53());
+		if (!RETAINED.has(id)) continue;
+		properties ??= new Map();
 		if (!properties.has(id)) properties.set(id, value);
 		else if (id === PROP_TIMESTAMP) {
 			throw new StreamError(StreamCode.MalformedTrack, { message: "object Timestamp repeats" });
@@ -248,7 +255,7 @@ export class Frame {
 	payload?: Uint8Array;
 	/** The presentation timestamp carried in object properties, when present. */
 	timestamp?: Timestamp;
-	/** Every Object Property the object arrived with, its Timestamp included; absent when it had none. */
+	/** The LOC public Object Properties the object arrived with, its Timestamp included; absent when it had none. */
 	properties?: ObjectProperties;
 	/**
 	 * An END_OF_TRACK marker: no object at or past its location exists. At object 0 its group
@@ -329,19 +336,20 @@ export class Frame {
 
 		let timestamp: Timestamp | undefined;
 		let properties: ObjectProperties | undefined;
+		let hasProperties = false;
 		if (flags.hasExtensions) {
 			const extensionsLength = c.u53();
 			if (extensionsLength > MAX_OBJECT_EXTENSIONS) {
 				throw new StreamError(StreamCode.MalformedTrack, { message: "object extensions exceed 64 KiB" });
 			}
 			if (extensionsLength !== 0) {
+				hasProperties = true;
 				properties = c.exact(extensionsLength, decodeObjectProperties);
 				// A track that declared no timescale is untimed, so its objects stay untimed even
 				// if one carries a Timestamp: there are no units to read it in.
 				if (timescale !== undefined) timestamp = objectTime(properties, timescale);
 			}
 		}
-		const hasProperties = properties !== undefined;
 
 		const payloadLength = c.u53();
 

@@ -1,6 +1,7 @@
 import type { Instant } from "@moq/clock";
 import type { Frame, ObjectProperties } from "../group.ts";
 import type { Timestamp } from "../time.ts";
+import { propertyBytes } from "../util/properties.ts";
 import { Decoder } from "./decoder.ts";
 import { Encoder } from "./encoder.ts";
 
@@ -79,9 +80,11 @@ export class Compression {
 			this.#encoder ??= new Encoder();
 			slice = { payload: this.#encoder.frame(frame.payload), inflated: frame.payload.length };
 		} else slice = { payload: frame.payload, inflated };
-		this.declared += slice.inflated;
-		this.stored += slice.payload.length;
-		this.bytes += slice.payload.length;
+		// Properties stay plain beside the slice, charged to every budget the payload is.
+		const properties = propertyBytes(frame.properties);
+		this.declared += slice.inflated + properties;
+		this.stored += slice.payload.length + properties;
+		this.bytes += slice.payload.length + properties;
 		const index = this.#frames.length;
 		this.#frames.push(slice);
 		const result = new SliceFrame(frame, () => this.#inflate(index));

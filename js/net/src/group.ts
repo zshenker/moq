@@ -17,6 +17,7 @@ import {
 import { Compression, stored } from "./flate/group.ts";
 import { type Expiry, type GroupRecover, hooks, type ReadGroupFrame, type Replacement } from "./internal.ts";
 import type { Timestamp } from "./time.ts";
+import { propertyBytes } from "./util/properties.ts";
 
 /** Maximum bytes of frames in a group. A write that would exceed this aborts with {@link GroupTooLarge}. */
 export const MAX_GROUP_CACHE_BYTES = 32 * 1024 * 1024;
@@ -48,11 +49,12 @@ export interface Frame {
 	 */
 	arrived?: Instant;
 	/**
-	 * The MoQ Object Properties a moq-transport object arrived with, absent when it had none.
+	 * The LOC public properties (draft-ietf-moq-loc-04 section 6.1) a moq-transport object carried
+	 * as MoQ Object Properties, absent when it carried none; any other property is dropped.
 	 *
 	 * Read side only: the moq-transport subscriber records them and no publisher sends them on,
-	 * so they never reach another hop, and moq-lite carries none. They exist for a container that
-	 * frames media in them, as LOC does (draft-ietf-moq-loc-04 section 2.2).
+	 * so they never reach another hop, and moq-lite carries none. They exist for LOC, which frames
+	 * media in them (section 2.2), and count against the group's cache budget like payload.
 	 */
 	properties?: ObjectProperties;
 }
@@ -151,7 +153,7 @@ function appendFrame(state: GroupState, frame: Frame) {
 	state.timestamp ??= frame.timestamp;
 	if (frame.timestamp === undefined) state.latest = undefined;
 	else if (state.latest === undefined || state.latest.isBefore(frame.timestamp)) state.latest = frame.timestamp;
-	state.cacheBytes += stored(frame)?.payload.length ?? frame.payload.byteLength;
+	state.cacheBytes += (stored(frame)?.payload.length ?? frame.payload.byteLength) + propertyBytes(frame.properties);
 	state.frames.mutate((frames) => {
 		frames.push(frame);
 	});
@@ -417,11 +419,12 @@ export class Producer {
 			const start = frame.timestamp;
 			commits = this.#admits.map((admit) => admit(start));
 		}
+		const properties = propertyBytes(frame.properties);
 		if (
 			this.#state.total.peek() - this.#state.offset >= MAX_GROUP_FRAMES ||
 			((!this.#state.flate || inflated !== undefined) &&
-				this.#state.cacheBytes + frame.payload.byteLength > MAX_GROUP_CACHE_BYTES) ||
-			(this.#state.flate?.declared ?? this.#state.cacheBytes) + (inflated ?? frame.payload.length) >
+				this.#state.cacheBytes + frame.payload.byteLength + properties > MAX_GROUP_CACHE_BYTES) ||
+			(this.#state.flate?.declared ?? this.#state.cacheBytes) + (inflated ?? frame.payload.length) + properties >
 				MAX_GROUP_CACHE_BYTES
 		) {
 			this.#overflow();

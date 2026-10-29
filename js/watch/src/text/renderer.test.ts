@@ -1,4 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
+import { Micro } from "@moq/clock";
+import * as Container from "@moq/hang/container";
+import { Group } from "@moq/net";
 import { parseText, VTTCue } from "media-captions";
 import {
 	type CueStore,
@@ -9,6 +12,7 @@ import {
 	pruneCues,
 	rollUp,
 	sanitizeCue,
+	textSamples,
 } from "./renderer";
 
 function store(cues: VTTCue[] = []): CueStore {
@@ -282,5 +286,26 @@ describe("sanitizeCue", () => {
 		expect(html(sanitizeCue("a < b > c"))).toBe("a &lt; b &gt; c");
 		expect(html(sanitizeCue('she said "hi"'))).toBe("she said &quot;hi&quot;");
 		expect(html(sanitizeCue("[BUNNY SNORES]"))).toBe("[BUNNY SNORES]");
+	});
+});
+
+describe("textSamples", () => {
+	test("decodes a cue on an ietf-loc track from its Object Properties", async () => {
+		const group = new Group.Producer(0);
+		const cue = new TextEncoder().encode("WEBVTT\n\n00:00.000 --> 00:01.000\nhello");
+		group.writeFrame({
+			payload: cue,
+			properties: new Map<bigint, bigint | Uint8Array>([
+				[0x08n, 1000n],
+				[0x10n, 2500n],
+			]),
+		});
+		group.finish();
+
+		const samples = [];
+		for await (const sample of textSamples(group.consume(), new Container.Loc.ObjectFormat())) samples.push(sample);
+		expect(samples).toHaveLength(1);
+		expect(samples[0].payload).toEqual(cue);
+		expect(samples[0].timestamp).toBe(Micro(2_500_000));
 	});
 });
