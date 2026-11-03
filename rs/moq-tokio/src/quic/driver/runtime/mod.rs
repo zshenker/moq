@@ -2,14 +2,14 @@ use std::{
 	fmt::{self, Debug},
 	io::{self, IoSliceMut},
 	net::SocketAddr,
-	sync::{Arc, Mutex, RwLock},
+	sync::{Arc, Mutex, OnceLock, RwLock},
 	task::{Context, Poll, Waker, ready},
 	time::Duration,
 };
 
 use moq_sock::udp::{RecvMeta, Transmit};
 
-use crate::quic::driver::Instant;
+use crate::{quic::driver::Instant, runtime::Spawner};
 
 /// A UDP socket an [`Endpoint`](super::endpoint::Endpoint) runs on, for a runtime or transport of your own
 ///
@@ -33,6 +33,27 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
 	/// [`moq_quic::connection::Connection::handle_unreachable`]; any other is logged and the
 	/// datagram counted as lost.
 	fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()>;
+
+	/// Send `transmit` past any queue the socket keeps, so that an error reaches the caller, as
+	/// [`try_send`](Self::try_send) does for a socket that keeps none (the default)
+	///
+	/// A queueing socket may still queue it rather than fail with `WouldBlock`.
+	fn try_send_now(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+		self.try_send(transmit)
+	}
+
+	/// Send as many of `transmits`, in order, as the socket has room for, returning how many
+	///
+	/// An error is the first transmit's, and sent none of them. The default sends one at a time;
+	/// a socket with a batched send (Linux `sendmmsg`) can do better.
+	fn try_send_many(&self, transmits: &[Transmit<'_>]) -> io::Result<usize> {
+		for (i, transmit) in transmits.iter().enumerate() {
+			if let Err(err) = self.try_send(transmit) {
+				return if i == 0 { Err(err) } else { Ok(i) };
+			}
+		}
+		Ok(transmits.len())
+	}
 
 	/// Register to be woken once the socket may have room to send again
 	///
@@ -72,6 +93,9 @@ pub(crate) struct Slot {
 	blocked: Arc<Blocked>,
 	/// When a send error was last logged, so a busy endpoint logs one per interval
 	last_send_error: Mutex<Option<Instant>>,
+	/// Where batched sends flush, once [`Self::batch_sends`] is on, so a socket swapped in is
+	/// batched too
+	batch: OnceLock<Spawner>,
 }
 
 impl Slot {
@@ -80,6 +104,19 @@ impl Slot {
 			socket: RwLock::new(Some(socket)),
 			blocked: Default::default(),
 			last_send_error: Default::default(),
+			batch: OnceLock::new(),
+		}
+	}
+
+	/// Batch sends across connections from now on, flushing on `runtime`, this socket's and any
+	/// swapped in
+	pub(crate) fn batch_sends(&self, runtime: &Spawner) {
+		let mut socket = self.socket.write().unwrap();
+		if self.batch.set(runtime.clone()).is_err() {
+			return;
+		}
+		if let Some(inner) = socket.take() {
+			*socket = Some(Box::new(BatchSocket::new(inner, runtime)));
 		}
 	}
 
@@ -87,12 +124,26 @@ impl Slot {
 	///
 	/// A released socket loses the datagram, which UDP always allows.
 	pub(crate) fn poll_send(&self, transmit: &Transmit<'_>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.poll_send_inner(transmit, cx, false)
+	}
+
+	/// [`poll_send`](Self::poll_send) past any batching, so that a send finding no
+	/// route still reaches the caller (see [`AsyncUdpSocket::try_send_now`])
+	pub(crate) fn poll_send_now(&self, transmit: &Transmit<'_>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.poll_send_inner(transmit, cx, true)
+	}
+
+	fn poll_send_inner(&self, transmit: &Transmit<'_>, cx: &mut Context<'_>, now: bool) -> Poll<io::Result<()>> {
 		let socket = self.socket.read().unwrap();
 		let Some(socket) = socket.as_deref() else {
 			return Poll::Ready(Ok(()));
 		};
 		loop {
-			match socket.try_send(transmit) {
+			let result = match now {
+				true => socket.try_send_now(transmit),
+				false => socket.try_send(transmit),
+			};
+			match result {
 				Ok(()) => return Poll::Ready(Ok(())),
 				Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
 				Err(err) => {
@@ -123,6 +174,10 @@ impl Slot {
 
 	/// Send through `socket` from now on, returning the one it replaces
 	pub(crate) fn replace(&self, socket: Box<dyn AsyncUdpSocket>) -> Option<Box<dyn AsyncUdpSocket>> {
+		let socket: Box<dyn AsyncUdpSocket> = match self.batch.get() {
+			Some(runtime) => Box::new(BatchSocket::new(socket, runtime)),
+			None => socket,
+		};
 		let previous = self.socket.write().unwrap().replace(socket);
 		// A sender blocked on the old socket would otherwise wait on it forever.
 		self.blocked.wake_all();
@@ -226,6 +281,9 @@ fn send_failed(last_send_error: &mut Option<Instant>, error: io::Error, transmit
 
 mod tokio;
 pub(crate) use tokio::wrap_udp_socket;
+
+mod batch;
+use batch::BatchSocket;
 
 #[cfg(test)]
 mod tests {

@@ -77,6 +77,8 @@ mod log {
 	pub(crate) use tracing::{debug, error, info, trace, warn};
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use imp::MAX_SEND_MANY;
 pub use imp::UdpSocketState;
 
 /// Number of UDP packets to send/receive at a time

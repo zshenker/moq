@@ -173,6 +173,46 @@ impl UdpSocketState {
 		send(self, socket.0, transmit)
 	}
 
+	/// Sends the first [`MAX_SEND_MANY`] or fewer of `transmits` in one `sendmmsg`, returning how
+	/// many the kernel took
+	///
+	/// An error is the first transmit's: a `WouldBlock` sent none of them. An `EIO` or `EINVAL`
+	/// retries that one transmit alone, with [`try_send`](Self::try_send)'s fallbacks.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	pub fn try_send_many(&self, socket: UdpSockRef<'_>, transmits: &[Transmit<'_>]) -> io::Result<usize> {
+		let transmits = &transmits[..transmits.len().min(MAX_SEND_MANY)];
+		if transmits.len() <= 1 {
+			return transmits.first().map_or(Ok(0), |t| send(self, socket.0, t).map(|()| 1));
+		}
+		let mut hdrs: [libc::mmsghdr; MAX_SEND_MANY] = unsafe { mem::zeroed() };
+		let mut iovs: [libc::iovec; MAX_SEND_MANY] = unsafe { mem::zeroed() };
+		let mut ctrls = [cmsg::Aligned([0u8; cmsg::LEN]); MAX_SEND_MANY];
+		let addrs: Vec<socket2::SockAddr> = transmits.iter().map(|t| t.destination.into()).collect();
+		for (i, transmit) in transmits.iter().enumerate() {
+			prepare_msg(
+				transmit,
+				&addrs[i],
+				&mut hdrs[i].msg_hdr,
+				&mut iovs[i],
+				&mut ctrls[i],
+				true,
+				self.sendmsg_einval(),
+			);
+		}
+		loop {
+			let n = unsafe { libc::sendmmsg(socket.0.as_raw_fd(), hdrs.as_mut_ptr(), transmits.len() as _, 0) };
+			if n >= 0 {
+				return Ok(n as usize);
+			}
+			let e = io::Error::last_os_error();
+			match e.raw_os_error() {
+				Some(libc::EINTR) => continue,
+				Some(libc::EIO) | Some(libc::EINVAL) => return send(self, socket.0, &transmits[0]).map(|()| 1),
+				_ => return Err(e),
+			}
+		}
+	}
+
 	/// Receives datagrams into `bufs`, filling one [`RecvMeta`] per message, and returns how many messages arrived.
 	#[cfg(not(any(
 		apple,
@@ -908,6 +948,10 @@ pub(crate) const BATCH_SIZE: usize = 32;
 #[cfg(apple_slow)]
 pub(crate) const BATCH_SIZE: usize = 1;
 
+/// The most transmits [`UdpSocketState::try_send_many`] sends in one call
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const MAX_SEND_MANY: usize = 64;
+
 // On Apple platforms using the `sendmsg_x` call, UDP datagram segmentation is not
 // offloaded to the NIC or even the kernel, but instead done here in user space in
 // [`send`]) and then passed to the OS as individual `iovec`s (up to `BATCH_SIZE`).
@@ -1056,6 +1100,47 @@ mod tests {
 		}
 		worker.join().unwrap();
 		assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+	}
+
+	/// One `sendmmsg` carries transmits to different peers in order, a GSO train among them, and
+	/// stops at [`MAX_SEND_MANY`].
+	#[test]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	fn send_many_reaches_every_peer() {
+		let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+		let receivers: Vec<_> = (0..2)
+			.map(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+			.collect();
+		for receiver in &receivers {
+			receiver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+		}
+		let state = UdpSocketState::new((&sender).into()).unwrap();
+		let train = [7u8; 12];
+		let contents: Vec<[u8; 3]> = (0..MAX_SEND_MANY as u8 + 2).map(|i| [i; 3]).collect();
+		let mut transmits: Vec<_> = contents
+			.iter()
+			.enumerate()
+			.map(|(i, contents)| Transmit {
+				destination: receivers[i % 2].local_addr().unwrap(),
+				ecn: None,
+				contents,
+				segment_size: None,
+				src_ip: None,
+			})
+			.collect();
+		transmits[1].contents = &train;
+		transmits[1].segment_size = (state.max_gso_segments() > 1).then_some(4);
+
+		let sent = state.try_send_many((&sender).into(), &transmits).unwrap();
+		assert_eq!(sent, MAX_SEND_MANY);
+		let mut buffer = [0; 16];
+		for (i, transmit) in transmits[..sent].iter().enumerate() {
+			let receiver = &receivers[i % 2];
+			for expected in transmit.contents.chunks(transmit.segment_size.unwrap_or(usize::MAX)) {
+				let len = receiver.recv(&mut buffer).unwrap();
+				assert_eq!(&buffer[..len], expected, "transmit {i}");
+			}
+		}
 	}
 
 	/// A coalesced ECT(0) GSO train brings every receive message at once, the GRO one included,

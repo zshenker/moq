@@ -2395,6 +2395,157 @@ async fn unroutable_dial_fails_with_no_viable_path() {
 	assert_eq!(err.code, moq_quic::TransportErrorCode::NO_VIABLE_PATH);
 }
 
+/// Batching sends doesn't hide a handshake's unreachable peer: the dial still fails at once.
+#[tokio::test]
+async fn batched_unreachable_dial_fails_with_no_viable_path() {
+	let _guard = subscribe();
+
+	let factory = EndpointFactory::new();
+	let server = factory.endpoint();
+	let outage = Arc::new(Outage::default());
+	outage.active.store(true, Ordering::SeqCst);
+	let client = Endpoint::new(
+		endpoint::Config::default(),
+		Box::new(UnreachableSocket {
+			inner: localhost_socket(),
+			outage,
+		}) as Box<dyn AsyncUdpSocket>,
+	)
+	.unwrap();
+	client.batch_sends();
+
+	let mut roots = RootCertStore::empty();
+	roots.add(factory.cert.cert.der().clone()).unwrap();
+	let client_config = client::Config::with_root_certificates(Arc::new(roots)).unwrap();
+	let err = timeout(
+		Duration::from_secs(5),
+		client
+			.connect(&client_config, server.local_addr(), "localhost")
+			.unwrap(),
+	)
+	.await
+	.expect("a batched send hid the unreachable peer until the handshake timeout")
+	.expect_err("nothing can be sent to an unreachable peer");
+	let crate::quic::driver::connection::Error::TransportError(err) = err else {
+		panic!("expected a transport error, got {err:?}");
+	};
+	assert_eq!(err.code, moq_quic::TransportErrorCode::NO_VIABLE_PATH);
+}
+
+/// Batched endpoints carry many connections' streams both ways, small sends and large.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_sends_carry_every_connection() {
+	const CONNECTIONS: usize = 16;
+	const LEN: usize = 256 << 10;
+	let _guard = subscribe();
+
+	let factory = EndpointFactory::new();
+	let server = factory.endpoint();
+	server.batch_sends();
+	let client = factory.endpoint();
+	client.batch_sends();
+	let addr = server.local_addr();
+
+	let echo = tokio::spawn(async move {
+		let mut tasks = Vec::new();
+		for _ in 0..CONNECTIONS {
+			let conn = server.accept().await.unwrap().accept().unwrap().await.unwrap();
+			tasks.push(tokio::spawn(async move {
+				let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+				let data = recv.read_to_end(LEN).await.unwrap();
+				send.write_all(&data[..]).await.unwrap();
+				let _ = send.finish().stopped().await;
+			}));
+		}
+		for task in tasks {
+			task.await.unwrap();
+		}
+	});
+	let mut tasks = Vec::new();
+	for i in 0..CONNECTIONS {
+		let conn = client.dial(addr, "localhost").unwrap().await.unwrap();
+		tasks.push(tokio::spawn(async move {
+			let len = if i % 2 == 0 { 100 } else { LEN };
+			let data: Vec<u8> = (0..len).map(|b| (b + i) as u8).collect();
+			let (mut send, mut recv) = conn.open_bi(Default::default()).await.unwrap();
+			send.write_all(&data[..]).await.unwrap();
+			drop(send.finish());
+			assert_eq!(recv.read_to_end(LEN).await.unwrap(), data);
+		}));
+	}
+	for task in tasks {
+		timeout(Duration::from_secs(30), task)
+			.await
+			.expect("a batched connection stalled")
+			.unwrap();
+	}
+	echo.await.unwrap();
+}
+
+/// Closing a batched endpoint still sends its closes, and frees the port by the time it returns.
+#[tokio::test]
+async fn closing_a_batched_endpoint_sends_its_closes_and_frees_the_port() {
+	let _guard = subscribe();
+
+	let factory = EndpointFactory::new();
+	let server = factory.endpoint();
+	let client = factory.endpoint();
+	client.batch_sends();
+	let client_addr = client.local_addr();
+	let (accepted, _connected) = tokio::try_join!(
+		async { server.accept().await.unwrap().accept().unwrap().await },
+		client.dial(server.local_addr(), "localhost").unwrap(),
+	)
+	.unwrap();
+
+	client.close(7u32.into(), "bye").await;
+	UdpSocket::bind(client_addr).expect("the closed endpoint still holds its port");
+	let err = wait_closed(&accepted).await;
+	assert!(
+		matches!(&err, crate::quic::driver::connection::Error::ApplicationClosed(close) if close.error_code == 7u32.into()),
+		"{err:?}"
+	);
+}
+
+/// A batched endpoint batches the socket a rebind swaps in, and its connections carry on over it.
+#[tokio::test]
+async fn a_batched_endpoint_stays_batched_across_a_rebind() {
+	let _guard = subscribe();
+
+	let factory = EndpointFactory::new();
+	let server = factory.endpoint();
+	let client = factory.endpoint();
+	client.batch_sends();
+	let (accepted, connected) = tokio::try_join!(
+		async { server.accept().await.unwrap().accept().unwrap().await },
+		client.dial(server.local_addr(), "localhost").unwrap(),
+	)
+	.unwrap();
+
+	client
+		.rebind(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+		.unwrap();
+	assert!(
+		format!("{:?}", client.inner.slot).contains("BatchSocket"),
+		"the rebound socket isn't batched"
+	);
+	let echo = tokio::spawn(async move {
+		let (mut send, mut recv) = accepted.accept_bi().await.unwrap();
+		let data = recv.read_to_end(16).await.unwrap();
+		send.write_all(&data[..]).await.unwrap();
+		let _ = send.finish().stopped().await;
+	});
+	let (mut send, mut recv) = connected.open_bi(Default::default()).await.unwrap();
+	send.write_all(&b"hello"[..]).await.unwrap();
+	drop(send.finish());
+	let reply = timeout(Duration::from_secs(5), recv.read_to_end(16))
+		.await
+		.expect("the rebound batched socket stalled")
+		.unwrap();
+	assert_eq!(reply, b"hello");
+	echo.await.unwrap();
+}
+
 /// Once established, a connection treats an unreachable destination as loss: a route that drops
 /// for a moment, as when a client switches networks, must not end the connection.
 #[tokio::test]

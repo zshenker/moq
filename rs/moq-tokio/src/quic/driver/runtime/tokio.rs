@@ -50,6 +50,13 @@ impl AsyncUdpSocket for UdpSocket {
 			.try_io(Interest::WRITABLE, || self.inner.try_send((&self.io).into(), transmit))
 	}
 
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	fn try_send_many(&self, transmits: &[moq_sock::udp::Transmit<'_>]) -> io::Result<usize> {
+		self.io.try_io(Interest::WRITABLE, || {
+			self.inner.try_send_many((&self.io).into(), transmits)
+		})
+	}
+
 	fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.io.poll_send_ready(cx)
 	}

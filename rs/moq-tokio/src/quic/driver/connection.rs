@@ -938,7 +938,13 @@ impl State {
 			};
 
 			let len = t.size;
-			match self.slot.poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx) {
+			// A handshake sends past any batching, so that no route fails it at once.
+			let transmit = udp_transmit(&t, &self.send_buffer[..len]);
+			let sent = match self.inner.is_handshaking() {
+				true => self.slot.poll_send_now(&transmit, cx),
+				false => self.slot.poll_send(&transmit, cx),
+			};
+			match sent {
 				Poll::Pending => {
 					self.buffered_transmit = Some(t);
 					return Ok(false);

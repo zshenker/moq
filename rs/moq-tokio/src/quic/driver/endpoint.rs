@@ -217,6 +217,16 @@ impl Endpoint {
 		Ok(())
 	}
 
+	/// Batch the datagrams every connection sends into one `sendmmsg` per scheduler round, from
+	/// now on and across any [`rebind`](Self::rebind)
+	///
+	/// This saves a syscall per send where many connections each send little, at the cost of
+	/// waiting out the round. Handshakes send at once, so a dial to a peer with no route still
+	/// fails straight away; once established, no route is loss either way.
+	pub fn batch_sends(&self) {
+		self.inner.slot.batch_sends(&self.inner.runtime);
+	}
+
 	/// Get the local `SocketAddr` the underlying socket is bound to
 	pub fn local_addr(&self) -> SocketAddr {
 		self.inner.state.lock().unwrap().local_addr
